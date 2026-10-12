@@ -3,6 +3,10 @@
 Open an issue describing the problem or proposal before a substantial change.
 Small fixes can be submitted directly as pull requests.
 
+For AI-assisted contributions, read [AGENTS.md](AGENTS.md). It describes the
+architecture, development workflow, safety invariants, and privacy requirements.
+Point your coding tool at that file if it does not load it automatically.
+
 Run the seeded Docker environment with `make dev`. Before submitting, run:
 
 ```sh
