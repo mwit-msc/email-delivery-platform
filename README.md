@@ -22,7 +22,7 @@ Use `docker compose logs -f web worker` for runtime logs. API errors contain an 
 
 ## Capabilities
 
-The expanded campaign/template API, Excel imports, image previews, webhooks, and named relays are available in `v1.1.0`. The existing `v1.0.0` image remains immutable.
+The expanded campaign/template API, Excel imports, image previews, webhooks, and named relays are available in `v1.1.1`, including compatibility with templates saved by v1. Earlier release images remain immutable.
 
 - Configurable OIDC with PKCE S256, state/nonce validation, signed ID tokens, pairwise identities, refresh rotation, and fresh group claims.
 - Independent local username/password login with Argon2id, login throttling, server sessions, and CSRF protection.
@@ -189,7 +189,7 @@ A trusted gateway integration can submit:
 Copy `.env.production.example` to `.env.production`, set a real PostgreSQL connection, `PUBLIC_URL`, a stable 32-byte base64 `SECRET_KEY`, root bootstrap credentials, a primary SMTP endpoint (or configure it after root login). Configure SMTP authentication, PMG, and OIDC through Settings or bootstrap environment values. Put HTTPS termination in front of the localhost-bound web port. Development defaults are not used by `compose.production.yaml`.
 
 ```sh
-EDP_IMAGE=ghcr.io/mwit-msc/email-delivery-platform:v1.0.0 \
+EDP_IMAGE=ghcr.io/mwit-msc/email-delivery-platform:v1.1.1 \
   docker compose -f compose.production.yaml up -d
 ```
 

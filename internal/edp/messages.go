@@ -119,6 +119,9 @@ func renderMessageWith(ctx context.Context, query rowQuerier, app, slug string, 
 	if strings.ContainsAny(r.Subject, "\r\n") {
 		return r, fmt.Errorf("subject contains a newline")
 	}
+	// Older saved versions may contain URL-encoded placeholder braces. Decode
+	// through the same sanitizer before substitution, without rewriting versions.
+	r.HTML = cleanHTML(r.HTML)
 	if r.HTML, e = renderVariables(r.HTML, vars, true); e != nil {
 		return r, e
 	}
