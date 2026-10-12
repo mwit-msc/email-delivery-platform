@@ -123,6 +123,9 @@ func (a *App) settings(w http.ResponseWriter, r *http.Request) {
 		tab = "limits"
 	}
 	if r.Method == "POST" {
+		if a.relaySettingsAction(w, r) {
+			return
+		}
 		action := r.FormValue("action")
 		if action == "" || action == "limits" {
 			rate, connections := positiveInt(r.FormValue("rate")), positiveInt(r.FormValue("connections"))
@@ -241,7 +244,15 @@ func (a *App) settings(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/settings?tab="+group+"&saved=1", 303)
 		return
 	}
-	data, _ := a.one(r.Context(), "SELECT paused,rate_per_minute,max_connections,circuit_until FROM platform_settings WHERE id=1")
-	a.render(w, r, "settings", map[string]any{"Settings": data, "Live": runtimeView(c), "SMTP": c.SMTPAddress, "Issuer": c.Issuer, "Retention": c.RetentionDays, "PMG": c.PMGURL, "PMGNodes": strings.Join(c.PMGNodes, ", "), "Secondary": c.SecondarySMTPAddress, "Tab": tab, "Saved": r.URL.Query().Get("saved") == "1"})
+	data, _ := a.one(r.Context(), "SELECT paused,rate_per_minute,max_connections,circuit_until,strict_sender_domains FROM platform_settings WHERE id=1")
+	relays, _ := a.listRelays(r.Context())
+	routes, _ := a.query(r.Context(), "SELECT d.domain,d.relay_id,r.name FROM sender_domain_routes d JOIN smtp_relays r ON r.id=d.relay_id ORDER BY domain")
+	selected := map[string]any{"tls": "starttls", "enabled": true}
+	for _, relay := range relays {
+		if relay["id"] == r.URL.Query().Get("relay") {
+			selected = relay
+		}
+	}
+	a.render(w, r, "settings", map[string]any{"Settings": data, "Relays": relays, "DomainRoutes": routes, "Relay": selected, "Live": runtimeView(c), "SMTP": c.SMTPAddress, "Issuer": c.Issuer, "Retention": c.RetentionDays, "PMG": c.PMGURL, "PMGNodes": strings.Join(c.PMGNodes, ", "), "Secondary": c.SecondarySMTPAddress, "Tab": tab, "Saved": r.URL.Query().Get("saved") == "1"})
 }
 func positiveInt(s string) int { n, _ := strconv.Atoi(s); return n }

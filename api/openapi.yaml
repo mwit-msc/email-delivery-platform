@@ -1,9 +1,12 @@
 openapi: 3.1.0
 info:
   title: Email Delivery Platform
-  version: 1.0.0
+  version: 1.1.0
+  description: Application-scoped bearer API for durable delivery, templates, campaigns, assets, and webhooks.
+    relay.manage is a privileged platform-wide permission. Expanded API operations reject unknown JSON
+    fields and multiple JSON values.
 security:
-  - serviceKey: []
+- serviceKey: []
 components:
   securitySchemes:
     serviceKey:
@@ -12,68 +15,522 @@ components:
   schemas:
     Message:
       type: object
-      required: [to, template, variables]
+      required:
+      - to
+      - template
+      - variables
       properties:
-        to: {type: string, format: email}
-        template: {type: string}
-        template_version: {type: integer, minimum: 1}
-        variables: {type: object, additionalProperties: {type: string}}
-        class: {type: string, enum: [transactional, otp], default: transactional}
-        schedule_at: {type: string, format: date-time}
-        expires_at: {type: string, format: date-time}
+        to:
+          type: string
+          format: email
+        template:
+          type: string
+        template_version:
+          type: integer
+          minimum: 1
+        variables:
+          type: object
+          additionalProperties:
+            type: string
+        class:
+          type: string
+          enum:
+          - transactional
+          - otp
+          default: transactional
+        schedule_at:
+          type: string
+          format: date-time
+        expires_at:
+          type: string
+          format: date-time
+        application_id:
+          type: string
+          description: Optional; must match the bearer key application. Omit to use key scope.
       additionalProperties: false
+    Error:
+      type: object
+      properties:
+        error:
+          type: string
+      additionalProperties: false
+      required:
+      - error
+    TemplateInput:
+      type: object
+      properties:
+        slug:
+          type: string
+          pattern: ^[a-z0-9._-]{1,100}$
+        name:
+          type: string
+          maxLength: 200
+        subject:
+          type: string
+          maxLength: 998
+          description: Required; no CR/LF; byte limit 998.
+        html:
+          type: string
+          description: Sanitized email HTML; maximum 2 MiB.
+        plain:
+          type: string
+          description: Plain-text alternative; generated from HTML when empty; maximum 2 MiB.
+        project:
+          description: Sanitized GrapesJS project JSON; maximum 2 MiB.
+        version:
+          type: integer
+          minimum: 1
+          description: Current version required when updating; optimistic concurrency check. Creation
+            always starts at version 1.
+      additionalProperties: false
+      required:
+      - subject
+      description: Creation also requires slug and name. Updates append an immutable version and do not
+        rename the template.
+    TemplatePreview:
+      type: object
+      properties:
+        template:
+          $ref: '#/components/schemas/TemplateInput'
+        variables:
+          type: object
+          additionalProperties:
+            type: string
+        version:
+          type: integer
+          minimum: 0
+          description: Stored version to preview; zero or omitted selects current version. Ignored when
+            template is supplied.
+      additionalProperties: false
+      required:
+      - variables
+      description: Supply template to render unsaved content without persisting or sending it; otherwise
+        render a stored version.
+    RenderedTemplate:
+      type: object
+      properties:
+        subject:
+          type: string
+        html:
+          type: string
+        plain:
+          type: string
+      additionalProperties: false
+      required:
+      - subject
+      - html
+      - plain
+    AwardRule:
+      type: object
+      properties:
+        event:
+          type: string
+          description: Exact imported event value, or empty to match any event.
+        award:
+          type: string
+          description: Exact imported award label.
+        template:
+          type: string
+          description: Template slug or ID in this application.
+      additionalProperties: false
+      required:
+      - award
+      - template
+    Mapping:
+      type: object
+      properties:
+        email:
+          type: integer
+          minimum: -1
+          maximum: 51
+          description: Zero-based column index; -1 means no column.
+        school:
+          type: integer
+          minimum: -1
+          maximum: 51
+          description: Zero-based column index; -1 means no column.
+        event:
+          type: integer
+          minimum: -1
+          maximum: 51
+          description: Zero-based column index; -1 means no column.
+        award:
+          type: integer
+          minimum: -1
+          maximum: 51
+          description: Zero-based column index; -1 means no column.
+        url:
+          type: integer
+          minimum: -1
+          maximum: 51
+          description: Zero-based column index; -1 means no column.
+        default_event:
+          type: string
+        default_award:
+          type: string
+        rules:
+          type: array
+          items:
+            $ref: '#/components/schemas/AwardRule'
+        columns:
+          type: object
+          additionalProperties:
+            type: integer
+            minimum: 0
+            maximum: 51
+          description: Additional template variable names mapped to zero-based columns.
+        constants:
+          type: object
+          additionalProperties:
+            type: string
+        skip_rows_without_email:
+          type: boolean
+          default: false
+          description: Skip rows whose mapped email cell is empty, such as worksheet footers.
+      additionalProperties: false
+      required:
+      - email
+      - school
+      - event
+      - award
+      - url
+      description: Certificate mapping. An empty event/award cell uses its default. Without a matching
+        rule, template slug is event.award. Supplies school_name and certificate_url automatically. Additional
+        columns override constants of the same name.
+    BulkMapping:
+      type: object
+      properties:
+        template:
+          type: string
+          description: Template slug or ID.
+        email:
+          type: integer
+          minimum: 0
+          maximum: 51
+        columns:
+          type: object
+          additionalProperties:
+            type: integer
+            minimum: 0
+            maximum: 51
+        constants:
+          type: object
+          additionalProperties:
+            type: string
+      additionalProperties: false
+      required:
+      - template
+      - email
+      description: General bulk mapping. Column values override constants with the same name.
+    CampaignCreate:
+      type: object
+      properties:
+        name:
+          type: string
+          maxLength: 200
+        kind:
+          type: string
+          enum:
+          - certificate
+          - bulk
+          default: certificate
+      additionalProperties: false
+      required:
+      - name
+    CampaignImport:
+      type: object
+      properties:
+        rows:
+          type: array
+          items:
+            type: array
+            items:
+              type: string
+            maxItems: 52
+          maxItems: 5001
+          description: First row is headers; at most 5000 data rows.
+        sheet_url:
+          type: string
+          format: uri
+          description: Read-only Google Sheets URL; gid selects the tab. Requires configured service-account
+            access.
+      additionalProperties: false
+      description: Supply rows or sheet_url. A nonempty sheet_url selects Google Sheets import.
+    CampaignAction:
+      type: object
+      properties:
+        schedule_at:
+          type: string
+          format: date-time
+          description: For start; RFC3339. Omit to start now.
+        to:
+          type: string
+          format: email
+          description: For test; receives one test email using the first valid included row.
+        row_id:
+          type: string
+          description: For exclude.
+        excluded:
+          type: boolean
+          description: For exclude; false includes a previously excluded row.
+      additionalProperties: false
+      description: Every action requires a JSON object, including {} when no fields are needed. Actions
+        preserve campaign state and delivery limits.
+    RelayInput:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Optional on creation; update/test path ID takes precedence. Omit to create an opaque
+            ID.
+        name:
+          type: string
+          maxLength: 120
+        address:
+          type: string
+          description: SMTP host:port; numeric port 1–65535.
+        username:
+          type: string
+          maxLength: 512
+        password:
+          type: string
+          maxLength: 4096
+          writeOnly: true
+          description: Replacement secret; blank retains an existing secret.
+        tls:
+          type: string
+          enum:
+          - tls
+          - starttls
+          - none
+          description: none is development-only.
+        bounce_domain:
+          type: string
+          description: Optional exact ASCII/punycode envelope-sender domain.
+        allowed_domains:
+          type: array
+          items:
+            type: string
+          description: Exact lowercased sender From-address domains; no wildcards or suffix matching.
+            New relays require at least one. Empty lists allow no sending.
+        enabled:
+          type: boolean
+          description: Send true explicitly to enable the relay.
+        fallback_id:
+          type: string
+          description: Optional named fallback relay ID; empty removes fallback. Cycles are rejected.
+        clear_password:
+          type: boolean
+          default: false
+          description: Explicitly remove the saved SMTP password; do not combine with a new password.
+      additionalProperties: false
+      required:
+      - name
+      - address
+      - tls
+      - allowed_domains
+      - enabled
+    RelayRouting:
+      type: object
+      properties:
+        strict:
+          type: boolean
+          description: Toggle strict routing; default platform setting is false. Cannot combine with domain.
+        domain:
+          type: string
+          description: Exact sender From-address domain, normalized to lowercase ASCII/punycode.
+        relay_id:
+          type: string
+          description: Relay allowing this domain; empty removes this domain route.
+      additionalProperties: false
+      description: Supply either strict, or domain and relay_id. Strict mode rejects unmapped sender domains.
+        Non-strict unmapped domains retain legacy primary SMTP behavior.
+    WebhookInput:
+      type: object
+      properties:
+        name:
+          type: string
+          maxLength: 100
+        url:
+          type: string
+          format: uri
+          description: Public HTTPS URL without credentials/fragments. All DNS answers must be public;
+            redirects are not followed.
+        secret:
+          type: string
+          writeOnly: true
+          maxLength: 1024
+          description: New endpoints require a 32–1024 byte signing secret. Blank retains existing secret
+            on update.
+        enabled:
+          type: boolean
+          description: Send true explicitly to enable; false cancels outstanding deliveries.
+      additionalProperties: false
+      required:
+      - name
+      - url
+      - enabled
+    WebhookEvent:
+      type: object
+      properties:
+        event_id:
+          type: integer
+        message_id:
+          type: string
+        application_id:
+          type: string
+        campaign_id:
+          type:
+          - string
+          - 'null'
+        status:
+          type: string
+        detail:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+      additionalProperties: false
+      required:
+      - event_id
+      - message_id
+      - application_id
+      - status
+      - created_at
+    CreatedID:
+      type: object
+      properties:
+        id:
+          type: string
+      additionalProperties: false
+      required:
+      - id
+    Success:
+      type: object
+      properties:
+        success:
+          type: boolean
+      additionalProperties: false
+      required:
+      - success
+    Me:
+      type: object
+      properties:
+        application_id:
+          type: string
+        key_id:
+          type: string
+        scopes:
+          type: array
+          items:
+            type: string
+        version:
+          type: string
+      additionalProperties: false
+      required:
+      - application_id
+      - key_id
+      - scopes
+      - version
+  responses:
+    BadRequest:
+      description: Invalid input or operation not permitted in the current state
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Bearer service key required
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: Permission or application scope denied
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
 paths:
   /v1/messages:
     post:
       operationId: submitMessage
       summary: Persist a message for asynchronous delivery
       parameters:
-        - in: header
-          name: Idempotency-Key
-          required: true
-          schema: {type: string, maxLength: 200}
+      - in: header
+        name: Idempotency-Key
+        required: true
+        schema:
+          type: string
+          maxLength: 200
       requestBody:
         required: true
         content:
           application/json:
-            schema: {$ref: '#/components/schemas/Message'}
+            schema:
+              $ref: '#/components/schemas/Message'
       responses:
-        '202': {description: Durably accepted or replayed, with id and status_url}
-        '400': {description: Invalid message or missing template variables}
-        '401': {description: Service key missing or invalid}
-        '403': {description: Scope denied}
-        '409': {description: Conflicting idempotency payload or paused application}
-        '429': {description: Quota or queue capacity exceeded; no message persisted}
-        '503': {description: Platform admission paused}
+        '202':
+          description: Durably accepted or replayed
+          with id and status_url: null
+        '400':
+          description: Invalid message or missing template variables
+        '401':
+          description: Service key missing or invalid
+        '403':
+          description: Scope denied
+        '409':
+          description: Conflicting idempotency payload or paused application
+        '429':
+          description: Quota or queue capacity exceeded; no message persisted
+        '503':
+          description: Platform admission paused
+      description: Requires message.send; OTP class also requires message.otp. Only transactional or OTP
+        admission; bulk uses campaign approval and start. Sender relay is chosen from the application
+        From domain and persisted durably.
   /v1/messages/{id}:
     parameters:
-      - in: path
-        name: id
-        required: true
-        schema: {type: string}
+    - in: path
+      name: id
+      required: true
+      schema:
+        type: string
     get:
       operationId: getMessage
       summary: Read an application's message delivery status
       responses:
-        '200': {description: Message status and attempt count}
-        '401': {description: Authentication required}
-        '403': {description: Key cannot read this application's messages}
-        '404': {description: Message not found}
+        '200':
+          description: Message status and attempt count
+        '401':
+          description: Authentication required
+        '403':
+          description: Key cannot read this application's messages
+        '404':
+          description: Message not found
+      description: Requires message.view. relay_accepted is gateway acceptance; remote_accepted is recipient-server
+        acceptance, not inbox placement or reading.
   /v1/messages/{id}/cancel:
     parameters:
-      - in: path
-        name: id
-        required: true
-        schema: {type: string}
+    - in: path
+      name: id
+      required: true
+      schema:
+        type: string
     post:
       operationId: cancelMessage
       summary: Cancel before the SMTP dispatch boundary
       responses:
-        '200': {description: Cancelled}
-        '401': {description: Authentication required}
-        '403': {description: Cancellation scope denied}
-        '404': {description: Message not found}
-        '409': {description: Already in flight or terminal}
+        '200':
+          description: Cancelled
+        '401':
+          description: Authentication required
+        '403':
+          description: Cancellation scope denied
+        '404':
+          description: Message not found
+        '409':
+          description: Already in flight or terminal
+      description: Requires message.cancel. In-flight SMTP delivery cannot be recalled.
   /v1/delivery-events:
     post:
       operationId: reportDelivery
@@ -84,16 +541,893 @@ paths:
           application/json:
             schema:
               type: object
-              required: [message_id, status, event_key]
+              required:
+              - message_id
+              - status
+              - event_key
               properties:
-                message_id: {type: string}
-                status: {type: string, enum: [remote_accepted, bounced]}
-                event_key: {type: string, maxLength: 200}
-                detail: {type: string, maxLength: 512}
+                message_id:
+                  type: string
+                status:
+                  type: string
+                  enum:
+                  - remote_accepted
+                  - bounced
+                event_key:
+                  type: string
+                  maxLength: 200
+                detail:
+                  type: string
+                  maxLength: 512
       responses:
-        '200': {description: Recorded or replayed}
-        '400': {description: Invalid report}
-        '401': {description: Authentication required}
-        '403': {description: Reporting scope denied}
-        '404': {description: Message outside application or not found}
-        '409': {description: Invalid message state or conflicting event key}
+        '200':
+          description: Recorded or replayed
+        '400':
+          description: Invalid report
+        '401':
+          description: Authentication required
+        '403':
+          description: Reporting scope denied
+        '404':
+          description: Message outside application or not found
+        '409':
+          description: Invalid message state or conflicting event key
+      description: Requires privileged delivery.report, issued by a platform administrator. Trusted outcomes
+        are application-scoped and event-key deduplicated.
+  /v1/me:
+    get:
+      operationId: getServiceIdentity
+      summary: Inspect service-key application, scopes, and server version
+      description: Requires any valid service key.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Me'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/templates:
+    get:
+      operationId: listTemplates
+      summary: List current templates in this application
+      description: Requires template.view.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  templates:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                additionalProperties: false
+                required:
+                - templates
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      operationId: createTemplate
+      summary: Create a template and immutable version 1
+      description: Requires template.edit.
+      responses:
+        '201':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  version:
+                    type: integer
+                additionalProperties: false
+                required:
+                - id
+                - version
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TemplateInput'
+  /v1/templates/{id}:
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        type: string
+    get:
+      operationId: getTemplate
+      summary: Read template content and editor project
+      description: Requires template.view.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+      parameters:
+      - in: query
+        name: version
+        schema:
+          type: integer
+          minimum: 1
+        description: Omit to read the current version.
+    put:
+      operationId: updateTemplate
+      summary: Append a template version with optimistic concurrency
+      description: Requires template.edit.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  version:
+                    type: integer
+                  variables:
+                    type: array
+                    items:
+                      type: string
+                additionalProperties: false
+                required:
+                - id
+                - version
+                - variables
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: Current version changed; reload before saving
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TemplateInput'
+  /v1/templates/{id}/preview:
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        type: string
+    post:
+      operationId: previewTemplate
+      summary: Render stored or unsaved email content without sending
+      description: Requires template.view.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RenderedTemplate'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TemplatePreview'
+  /v1/assets:
+    post:
+      operationId: uploadEmailAsset
+      summary: Upload a publicly accessible email logo or image
+      description: Requires template.edit. Maximum 100 assets per application. Returned opaque URL is
+        public and immutable so email clients can load it; upload no private images.
+      responses:
+        '201':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  url:
+                    type: string
+                    format: uri
+                  mime_type:
+                    type: string
+                    enum:
+                    - image/png
+                    - image/jpeg
+                    - image/gif
+                additionalProperties: false
+                required:
+                - id
+                - url
+                - mime_type
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: PNG/JPEG/GIF up to 1 MiB and 16 megapixels.
+              additionalProperties: false
+              required:
+              - file
+  /email-assets/{id}:
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        type: string
+    get:
+      operationId: getEmailAsset
+      summary: Load an email image by its opaque public URL
+      security: []
+      responses:
+        '200':
+          description: Immutable image bytes
+          content:
+            image/png:
+              schema:
+                type: string
+                format: binary
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+            image/gif:
+              schema:
+                type: string
+                format: binary
+        '404':
+          description: Asset not found
+  /v1/imports/workbook-sheets:
+    post:
+      operationId: listWorkbookSheets
+      summary: Inspect XLSX tab names without importing
+      description: Requires campaign.edit.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sheets:
+                    type: array
+                    items:
+                      type: string
+                additionalProperties: false
+                required:
+                - sheets
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: XLSX workbook up to 8 MiB.
+              additionalProperties: false
+              required:
+              - file
+  /v1/campaigns:
+    get:
+      operationId: listCampaigns
+      summary: List up to 1000 recent campaigns in this application
+      description: Requires campaign.view.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  campaigns:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                additionalProperties: false
+                required:
+                - campaigns
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      operationId: createCampaign
+      summary: Create a draft bulk or certificate campaign
+      description: Requires campaign.edit. Requires a key issued by the dashboard with a recorded user
+        owner; recreate legacy ownerless keys.
+      responses:
+        '201':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  state:
+                    type: string
+                    enum:
+                    - draft
+                additionalProperties: false
+                required:
+                - id
+                - state
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CampaignCreate'
+  /v1/campaigns/{id}:
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        type: string
+    get:
+      operationId: getCampaign
+      summary: Read campaign, mapping, and up to 5000 recipient rows
+      description: Requires campaign.view.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/campaigns/{id}/import:
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        type: string
+    post:
+      operationId: importCampaign
+      summary: Replace the source snapshot of a draft campaign
+      description: Requires campaign.edit. First row is headers. Supports 5000 data rows and 52 columns;
+        trailing blanks are trimmed. Workbook formulas are not evaluated and external resources are not
+        fetched; cell hyperlink URLs are preserved.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rows:
+                    type: integer
+                  headers:
+                    type: array
+                    items:
+                      type: string
+                additionalProperties: false
+                required:
+                - rows
+                - headers
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CampaignImport'
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: CSV or XLSX up to 8 MiB.
+                sheet:
+                  type: string
+                  description: Exact XLSX tab name; defaults to first tab when omitted.
+              additionalProperties: false
+              required:
+              - file
+  /v1/campaigns/{id}/mapping:
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        type: string
+    post:
+      operationId: mapCampaign
+      summary: Validate and render draft recipient rows
+      description: Requires campaign.edit. Use Mapping for certificate campaigns and BulkMapping for bulk
+        campaigns. Inspect returned campaign rows for validation errors before approval.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mapped:
+                    type: boolean
+                additionalProperties: false
+                required:
+                - mapped
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+              - $ref: '#/components/schemas/Mapping'
+              - $ref: '#/components/schemas/BulkMapping'
+  /v1/campaigns/{id}/{action}:
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        type: string
+    - in: path
+      name: action
+      required: true
+      schema:
+        type: string
+        enum:
+        - approve
+        - start
+        - pause
+        - resume
+        - cancel
+        - draft
+        - exclude
+        - test
+    post:
+      operationId: controlCampaign
+      summary: Approve, schedule, test, or control a campaign
+      description: Requires campaign.approve for approve; campaign.send for start/pause/resume/cancel;
+        campaign.edit for draft/exclude/test. Requires a recorded key owner for every action. Approval
+        requires valid included rows. Start persists the frozen jobs atomically. draft is allowed only
+        while approved and unsent; exclusion is draft-only. Test sends one email to to and consumes normal
+        delivery quota.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Success'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CampaignAction'
+  /v1/campaigns/{id}/progress:
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        type: string
+    get:
+      operationId: getCampaignProgress
+      summary: Read campaign state and delivery counts
+      description: Requires campaign.view.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  state:
+                    type: string
+                  statuses:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        status:
+                          type: string
+                        count:
+                          type: integer
+                      additionalProperties: false
+                      required:
+                      - status
+                      - count
+                additionalProperties: false
+                required:
+                - id
+                - state
+                - statuses
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/campaigns/{id}/export:
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        type: string
+    get:
+      operationId: exportCampaignResults
+      summary: Download validation and delivery results as CSV
+      description: 'Requires campaign.view. UTF-8 CSV with BOM. Columns: source_row, recipient, template,
+        excluded, validation_errors, message_id, status, attempts, delivery_detail. Spreadsheet formula-leading
+        cells are escaped.'
+      responses:
+        '200':
+          description: CSV results
+          content:
+            text/csv:
+              schema:
+                type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /v1/webhooks:
+    get:
+      operationId: listWebhooks
+      summary: List endpoints and pending/failed counts without secrets
+      description: Requires webhook.manage.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  webhooks:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                additionalProperties: false
+                required:
+                - webhooks
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      operationId: createWebhook
+      summary: Register a signed delivery-event webhook
+      description: Requires webhook.manage. Maximum 20 endpoints per application. Events are delivered
+        at least once with eight attempts over at least 25.5 hours of backoff. Receivers deduplicate EDP-Event-ID,
+        validate freshness of EDP-Timestamp (Unix seconds), and verify EDP-Signature = v1=<hex HMAC-SHA256(secret,
+        timestamp + "." + exact request bytes)>. Success requires HTTP 2xx. Destination DNS is checked
+        on configuration and each connection; no redirects.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedID'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookInput'
+  /v1/webhooks/{id}:
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        type: string
+    put:
+      operationId: updateWebhook
+      summary: Update endpoint, rotate its signing secret, or disable it
+      description: Requires webhook.manage. Blank secret retains the saved secret. Disabling cancels queued/in-flight
+        webhook jobs; a request already transmitted may still arrive.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedID'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WebhookInput'
+  /v1/relays:
+    get:
+      operationId: listRelays
+      summary: Read named relays, exact domain routes, and strict mode
+      description: Requires relay.manage (privileged platform-wide). Only platform administrators may
+        issue relay.manage keys. Relay records expose password_set, never passwords or ciphertext.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  relays:
+                    type: array
+                    items:
+                      type: object
+                      additionalProperties: true
+                  routes:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        domain:
+                          type: string
+                        relay_id:
+                          type: string
+                      additionalProperties: false
+                      required:
+                      - domain
+                      - relay_id
+                  strict:
+                    type: boolean
+                additionalProperties: false
+                required:
+                - relays
+                - routes
+                - strict
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      operationId: createRelay
+      summary: Create a named SMTP relay
+      description: Requires relay.manage (privileged platform-wide).
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedID'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RelayInput'
+  /v1/relays/{id}:
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        type: string
+    put:
+      operationId: updateRelay
+      summary: Update a named relay and encrypted connection secret
+      description: Requires relay.manage (privileged platform-wide). Blank password retains; clear_password
+        removes. Disabling a relay or removing its domain allowance blocks dispatch through that relay.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreatedID'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RelayInput'
+  /v1/relays/{id}/test:
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        type: string
+    post:
+      operationId: testRelay
+      summary: Test entered SMTP configuration without saving or sending
+      description: Requires relay.manage (privileged platform-wide). Supply connection fields; blank password
+        uses the saved secret for this ID. Connects, negotiates TLS, authenticates, and sends NOOP; no
+        MAIL, RCPT, or DATA.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                additionalProperties: false
+                required:
+                - success
+                - message
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RelayInput'
+  /v1/relay-routing:
+    put:
+      operationId: setRelayRouting
+      summary: Set strict mode or one exact sender-domain route
+      description: Requires relay.manage (privileged platform-wide). Domains refer to the application
+        From address, not recipient domains. Named fallback is per source relay, opt-in per application,
+        once only after confirmed permanent IP reputation rejection; both relays must explicitly allow
+        the sender domain. No fallback for uncertainty, deferrals, invalid recipients, or quarantine.
+      responses:
+        '200':
+          description: Success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Success'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RelayRouting'

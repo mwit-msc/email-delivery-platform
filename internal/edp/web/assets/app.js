@@ -137,3 +137,20 @@ document.addEventListener('htmx:historyRestore', () => {
   activatePage();
 });
 activatePage();
+
+// Read workbook tabs before importing, without uploading recipients to a campaign.
+const workbookReads = new WeakMap();
+document.addEventListener('change', async event => {
+ const input=event.target;
+ if (!(input instanceof HTMLInputElement) || !input.dataset.workbookUrl) return;
+ const form=input.closest('form'), label=form.querySelector('[data-workbook-tab]');
+ const select=label.querySelector('select'), status=label.querySelector('[data-workbook-status]');
+ workbookReads.get(input)?.abort(); select.replaceChildren();
+ if (!input.files[0]?.name.toLowerCase().endsWith('.xlsx')) {label.hidden=true;return;}
+ label.hidden=false; status.textContent='Reading workbook tabs…';
+ const controller=new AbortController();workbookReads.set(input,controller);
+ pageLifetime?.signal.addEventListener('abort',()=>controller.abort(),{once:true});
+ const fields=new FormData();fields.set('file',input.files[0]);fields.set('csrf',form.querySelector('[name="csrf"]').value);
+ try {const response=await fetch(input.dataset.workbookUrl,{method:'POST',body:fields,signal:controller.signal});const data=await response.json();if(!response.ok)throw new Error(data.error||'Could not read workbook');for(const name of data.sheets){const option=document.createElement('option');option.value=name;option.textContent=name;select.append(option);}status.textContent='Choose the tab to import.';}
+ catch(error){if(!controller.signal.aborted)status.textContent=error.message;}
+});

@@ -209,6 +209,42 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/messages/{id}", a.apiMessage)
 	mux.HandleFunc("POST /v1/messages/{id}/cancel", a.apiCancel)
 	mux.HandleFunc("POST /v1/delivery-events", a.deliveryFeedback)
+	mux.HandleFunc("POST /applications/{id}/assets", a.uploadEmailAsset)
+	mux.HandleFunc("POST /applications/{id}/workbook-sheets", a.workbookSheets)
+	mux.HandleFunc("GET /email-assets/{id}", a.emailAsset)
+	mux.HandleFunc("POST /templates/{id}/preview", a.previewTemplate)
+	mux.HandleFunc("GET /campaigns/{id}/export", a.campaignExport)
+	mux.HandleFunc("GET /v1/templates", a.apiTemplates)
+	mux.HandleFunc("POST /v1/templates", a.apiTemplates)
+	mux.HandleFunc("GET /v1/templates/{id}", a.apiTemplate)
+	mux.HandleFunc("PUT /v1/templates/{id}", a.apiTemplate)
+	mux.HandleFunc("POST /v1/templates/{id}/preview", a.previewTemplate)
+	mux.HandleFunc("POST /v1/assets", a.uploadEmailAsset)
+	mux.HandleFunc("POST /v1/imports/workbook-sheets", a.apiWorkbookSheets)
+	mux.HandleFunc("GET /v1/campaigns", a.apiCampaigns)
+	mux.HandleFunc("POST /v1/campaigns", a.apiCampaigns)
+	mux.HandleFunc("GET /v1/campaigns/{id}", a.apiCampaign)
+	mux.HandleFunc("POST /v1/campaigns/{id}/import", a.apiCampaignImport)
+	mux.HandleFunc("POST /v1/campaigns/{id}/mapping", a.apiCampaignMapping)
+	mux.HandleFunc("GET /v1/campaigns/{id}/progress", a.apiCampaignProgress)
+	mux.HandleFunc("GET /v1/campaigns/{id}/export", a.campaignExport)
+	mux.HandleFunc("POST /v1/campaigns/{id}/{action}", a.apiCampaignAction)
+	mux.HandleFunc("GET /v1/me", func(w http.ResponseWriter, r *http.Request) {
+		p := person(r)
+		if p == nil {
+			problem(w, 401, "authentication required")
+			return
+		}
+		respond(w, 200, map[string]any{"application_id": p.Scope, "key_id": p.KeyID, "scopes": p.KeyScopes, "version": a.Version})
+	})
+	mux.HandleFunc("GET /v1/relays", a.apiRelays)
+	mux.HandleFunc("POST /v1/relays", a.apiRelays)
+	mux.HandleFunc("PUT /v1/relays/{id}", a.apiRelays)
+	mux.HandleFunc("POST /v1/relays/{id}/{operation}", a.apiRelays)
+	mux.HandleFunc("PUT /v1/relay-routing", a.apiRouting)
+	mux.HandleFunc("GET /v1/webhooks", a.apiWebhooks)
+	mux.HandleFunc("POST /v1/webhooks", a.apiWebhooks)
+	mux.HandleFunc("PUT /v1/webhooks/{id}", a.apiWebhooks)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if r.MultipartForm != nil {
@@ -294,16 +330,29 @@ func (a *App) application(w http.ResponseWriter, r *http.Request) {
 	var secret string
 	if r.Method == "POST" {
 		switch r.FormValue("action") {
+		case "webhook":
+			if !a.require(w, r, id, "webhook.manage") {
+				return
+			}
+			_, e = a.saveWebhook(r.Context(), id, r.FormValue("webhook_id"), r.FormValue("webhook_name"), r.FormValue("webhook_url"), r.FormValue("webhook_secret"), r.FormValue("webhook_enabled") == "on")
 		case "key":
 			if !a.Allowed(r.Context(), person(r), id, "key.manage") {
 				problem(w, 403, "permission denied")
 				return
 			}
 			scopes := r.Form["scopes"]
-			valid := []string{"message.send", "message.otp", "message.view", "message.cancel", "delivery.report"}
+			valid := serviceScopes
 			for _, s := range scopes {
 				if s == "delivery.report" && !a.Allowed(r.Context(), person(r), "*", "platform.manage") {
 					problem(w, 403, "only platform administrators may provision delivery-report credentials")
+					return
+				}
+				if s == "relay.manage" && !a.Allowed(r.Context(), person(r), "*", "platform.manage") {
+					problem(w, 403, "only platform administrators may grant relay management")
+					return
+				}
+				if s != "relay.manage" && s != "delivery.report" && !(s == "message.otp" && a.Allowed(r.Context(), person(r), id, "message.send")) && !a.Allowed(r.Context(), person(r), id, s) {
+					problem(w, 403, "you may only grant scopes you hold")
 					return
 				}
 				if !contains(valid, s) {
@@ -313,7 +362,7 @@ func (a *App) application(w http.ResponseWriter, r *http.Request) {
 			}
 			secret = newID("edp_")
 			expires := time.Now().Add(90 * 24 * time.Hour)
-			_, e = a.DB.Exec(r.Context(), "INSERT INTO api_keys(id,application_id,name,token_hash,scopes,expires_at) VALUES($1,$2,$3,$4,$5,$6)", newID("key_"), id, r.FormValue("name"), tokenHash(secret), scopes, expires)
+			_, e = a.DB.Exec(r.Context(), "INSERT INTO api_keys(id,application_id,name,token_hash,scopes,expires_at,created_by) VALUES($1,$2,$3,$4,$5,$6,$7)", newID("key_"), id, r.FormValue("name"), tokenHash(secret), scopes, expires, person(r).ID)
 		case "revoke":
 			if !a.Allowed(r.Context(), person(r), id, "key.manage") {
 				problem(w, 403, "permission denied")
@@ -361,7 +410,7 @@ func (a *App) application(w http.ResponseWriter, r *http.Request) {
 		problem(w, 500, "runtime configuration unavailable")
 		return
 	}
-	a.render(w, r, "application", map[string]any{"Application": data, "Keys": keys, "Secret": secret, "Scope": id, "SecondaryConfigured": config.SecondarySMTPAddress != ""})
+	a.render(w, r, "application", map[string]any{"Application": data, "Keys": keys, "Secret": secret, "Scope": id, "SecondaryConfigured": config.SecondarySMTPAddress != "" || a.hasNamedFallback(r.Context()), "KeyScopeOptions": a.grantableScopes(r), "Webhooks": a.webhookView(r.Context(), id)})
 }
 func (a *App) apiSubmit(w http.ResponseWriter, r *http.Request) {
 	p := person(r)

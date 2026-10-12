@@ -152,8 +152,23 @@ func (a *App) sheetRows(ctx context.Context, link string) ([][]string, error) {
 }
 
 type Mapping struct {
-	Email, School, Event, Award, URL int
-	DefaultEvent, DefaultAward       string
+	Email                int               `json:"email"`
+	School               int               `json:"school"`
+	Event                int               `json:"event"`
+	Award                int               `json:"award"`
+	URL                  int               `json:"url"`
+	DefaultEvent         string            `json:"default_event"`
+	DefaultAward         string            `json:"default_award"`
+	Rules                []AwardRule       `json:"rules"`
+	Columns              map[string]int    `json:"columns"`
+	Constants            map[string]string `json:"constants"`
+	SkipRowsWithoutEmail bool              `json:"skip_rows_without_email"`
+}
+
+type AwardRule struct {
+	Event    string `json:"event"`
+	Award    string `json:"award"`
+	Template string `json:"template"`
 }
 
 func cell(row []string, n int) string {
@@ -163,6 +178,17 @@ func cell(row []string, n int) string {
 	return strings.TrimSpace(row[n])
 }
 func (a *App) mapCampaign(ctx context.Context, id string, m Mapping) error {
+	if len(m.Rules) > 1000 {
+		return fmt.Errorf("at most 1000 award mapping rules")
+	}
+	seenRules := map[string]bool{}
+	for _, rule := range m.Rules {
+		key := rule.Event + "\x00" + rule.Award
+		if rule.Award == "" || rule.Template == "" || seenRules[key] {
+			return fmt.Errorf("award rules require a unique event/award and template")
+		}
+		seenRules[key] = true
+	}
 	tx, e := a.DB.Begin(ctx)
 	if e != nil {
 		return e
@@ -190,6 +216,9 @@ func (a *App) mapCampaign(ctx context.Context, id string, m Mapping) error {
 	seen := map[string]bool{}
 	for i, row := range rows[1:] {
 		email, school, event, award, link := cell(row, m.Email), cell(row, m.School), cell(row, m.Event), cell(row, m.Award), cell(row, m.URL)
+		if m.SkipRowsWithoutEmail && email == "" {
+			continue
+		}
 		if event == "" {
 			event = m.DefaultEvent
 		}
@@ -211,7 +240,25 @@ func (a *App) mapCampaign(ctx context.Context, id string, m Mapping) error {
 		var version *int
 		var tid string
 		var v int
-		err = tx.QueryRow(ctx, "SELECT id,current_version FROM templates WHERE application_id=$1 AND slug=$2", app, event+"."+award).Scan(&tid, &v)
+		slug := event + "." + award
+		genericTemplate := ""
+		for _, rule := range m.Rules {
+			if rule.Award != award {
+				continue
+			}
+			if rule.Event == event {
+				slug = rule.Template
+				genericTemplate = ""
+				break
+			}
+			if rule.Event == "" {
+				genericTemplate = rule.Template
+			}
+		}
+		if genericTemplate != "" {
+			slug = genericTemplate
+		}
+		err = tx.QueryRow(ctx, "SELECT id,current_version FROM templates WHERE application_id=$1 AND (slug=$2 OR id=$2)", app, slug).Scan(&tid, &v)
 		if err != nil {
 			errs = append(errs, "No template for event/award: "+event+"/"+award)
 		} else {
@@ -219,6 +266,19 @@ func (a *App) mapCampaign(ctx context.Context, id string, m Mapping) error {
 			version = &v
 		}
 		vars := map[string]string{"school_name": school, "certificate_url": link}
+		for k, v := range m.Constants {
+			vars[k] = v
+		}
+		for k, column := range m.Columns {
+			if column >= 0 {
+				vars[k] = cell(row, column)
+			}
+		}
+		if tpl != nil {
+			if _, err := renderMessageWith(ctx, tx, app, tid, v, vars); err != nil {
+				errs = append(errs, err.Error())
+			}
+		}
 		dispatch := tokenHash(strings.ToLower(email) + "|" + school + "|" + event + "|" + award + "|" + link)
 		if seen[dispatch] {
 			errs = append(errs, "Duplicate certificate dispatch")
@@ -231,6 +291,10 @@ func (a *App) mapCampaign(ctx context.Context, id string, m Mapping) error {
 		if _, e = tx.Exec(ctx, "INSERT INTO campaign_rows(id,campaign_id,ordinal,recipient,template_id,template_version,variables,errors,dispatch_key) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)", newID("row_"), id, i+2, email, tpl, version, data, errs, dispatch); e != nil {
 			return e
 		}
+	}
+	mapping, _ := json.Marshal(m)
+	if _, e = tx.Exec(ctx, "UPDATE campaigns SET mapping=$2 WHERE id=$1", id, mapping); e != nil {
+		return e
 	}
 	return tx.Commit(ctx)
 }
@@ -331,13 +395,17 @@ func (a *App) startCampaign(ctx context.Context, id string, scheduled time.Time)
 		items = append(items, i)
 	}
 	rows.Close()
+	relayID, relayError := senderRelayWith(ctx, tx, from)
+	if relayError != nil {
+		return relayError
+	}
 	for _, i := range items {
 		rendered, e := renderMessageWith(ctx, tx, app, i.Template, i.Version, i.Vars)
 		if e != nil {
 			return e
 		}
 		mid := newID("msg_")
-		_, e = tx.Exec(ctx, `INSERT INTO messages(id,application_id,campaign_id,recipient,from_address,reply_to,subject,html,plain,class,idempotency_key,payload_hash,available_at,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'bulk',$10,$11,$12,$13)`, mid, app, id, i.To, from, reply, rendered.Subject, rendered.HTML, rendered.Plain, "campaign:"+id+":"+i.Key, i.Key, scheduled, scheduled.Add(7*24*time.Hour))
+		_, e = tx.Exec(ctx, `INSERT INTO messages(id,application_id,campaign_id,recipient,from_address,reply_to,subject,html,plain,class,idempotency_key,payload_hash,available_at,expires_at,relay_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'bulk',$10,$11,$12,$13,NULLIF($14,''))`, mid, app, id, i.To, from, reply, rendered.Subject, rendered.HTML, rendered.Plain, "campaign:"+id+":"+i.Key, i.Key, scheduled, scheduled.Add(7*24*time.Hour), relayID)
 		if e != nil {
 			return e
 		}
@@ -426,13 +494,13 @@ func (a *App) campaign(w http.ResponseWriter, r *http.Request) {
 			if r.FormValue("sheet_url") != "" {
 				rows, e = a.sheetRows(r.Context(), r.FormValue("sheet_url"))
 			} else {
-				file, _, err := r.FormFile("csv")
+				file, header, err := r.FormFile("csv")
 				if err != nil {
-					e = fmt.Errorf("choose a CSV file or provide a sheet URL")
+					e = fmt.Errorf("choose a CSV or Excel file or provide a sheet URL")
 					break
 				}
 				defer file.Close()
-				rows, e = parseCSV(file)
+				rows, e = parseImport(file, header.Filename, r.FormValue("sheet"))
 			}
 			if e == nil {
 				e = a.replaceCampaignSource(r.Context(), id, rows)
@@ -459,55 +527,26 @@ func (a *App) campaign(w http.ResponseWriter, r *http.Request) {
 				}
 				e = a.mapBulkCampaign(r.Context(), id, r.FormValue("template"), parse("email"), columns, constants)
 			} else {
-				e = a.mapCampaign(r.Context(), id, Mapping{parse("email"), parse("school"), parse("event"), parse("award"), parse("url"), r.FormValue("default_event"), r.FormValue("default_award")})
+				m := Mapping{Email: parse("email"), School: parse("school"), Event: parse("event"), Award: parse("award"), URL: parse("url"), DefaultEvent: r.FormValue("default_event"), DefaultAward: r.FormValue("default_award"), SkipRowsWithoutEmail: r.FormValue("skip_empty_email") == "on"}
+				for key := range r.Form {
+					if strings.HasPrefix(key, "rule.") && r.FormValue(key) != "" {
+						m.Rules = append(m.Rules, AwardRule{Award: strings.TrimPrefix(key, "rule."), Template: r.FormValue(key)})
+					}
+				}
+				e = a.mapCampaign(r.Context(), id, m)
 			}
 		case "exclude":
 			e = a.toggleCampaignRow(r.Context(), id, r.FormValue("row"))
 
-		case "approve":
-			e = a.approveCampaign(r.Context(), id, person(r).ID)
-		case "draft":
-			if data["state"] != "approved" {
-				e = fmt.Errorf("only an approved, unsent campaign can return to draft")
-			} else {
-				_, e = a.DB.Exec(r.Context(), "UPDATE campaigns SET state='draft',approved_by=NULL,approved_at=NULL WHERE id=$1 AND state='approved'", id)
-			}
-		case "start":
-			when := time.Now()
-			if v := r.FormValue("schedule"); v != "" {
-				zone := time.FixedZone("Asia/Bangkok", 7*3600)
-				when, e = time.ParseInLocation("2006-01-02T15:04", v, zone)
+		case "approve", "draft", "start", "pause", "resume", "cancel", "test":
+			in := CampaignAction{To: r.FormValue("test_to")}
+			if value := r.FormValue("schedule"); value != "" {
+				var when time.Time
+				when, e = time.ParseInLocation("2006-01-02T15:04", value, time.FixedZone("Asia/Bangkok", 7*3600))
+				in.ScheduleAt = &when
 			}
 			if e == nil {
-				e = a.startCampaign(r.Context(), id, when)
-			}
-		case "pause":
-			_, e = a.DB.Exec(r.Context(), "UPDATE campaigns SET state='paused' WHERE id=$1 AND state='sending'", id)
-		case "resume":
-			_, e = a.DB.Exec(r.Context(), "UPDATE campaigns SET state='sending' WHERE id=$1 AND state='paused'", id)
-		case "cancel":
-			tx, err := a.DB.Begin(r.Context())
-			if err != nil {
-				e = err
-				break
-			}
-			defer tx.Rollback(r.Context())
-			_, e = tx.Exec(r.Context(), "UPDATE campaigns SET state='cancelled' WHERE id=$1 AND state IN('draft','approved','sending','paused')", id)
-			if e == nil {
-				_, e = tx.Exec(r.Context(), `WITH changed AS(UPDATE messages SET status='cancelled',updated_at=now() WHERE campaign_id=$1 AND status IN('queued','retry_wait') RETURNING id) INSERT INTO delivery_events(message_id,status) SELECT id,'cancelled' FROM changed`, id)
-			}
-			if e == nil {
-				e = tx.Commit(r.Context())
-			}
-		case "test":
-			var recipient, template string
-			var version int
-			var varsJSON []byte
-			e = a.DB.QueryRow(r.Context(), "SELECT recipient,template_id,template_version,variables FROM campaign_rows WHERE campaign_id=$1 AND NOT excluded AND cardinality(errors)=0 ORDER BY ordinal LIMIT 1", id).Scan(&recipient, &template, &version, &varsJSON)
-			if e == nil {
-				var vars map[string]string
-				json.Unmarshal(varsJSON, &vars)
-				_, _, e = a.Submit(r.Context(), SendInput{ApplicationID: scope, To: r.FormValue("test_to"), Template: template, Version: version, Variables: vars, Class: "transactional"}, newID("test_"))
+				e = a.actCampaign(r.Context(), id, scope, person(r).ID, action, in)
 			}
 		default:
 			e = fmt.Errorf("unknown campaign action")
@@ -532,7 +571,7 @@ func (a *App) campaign(w http.ResponseWriter, r *http.Request) {
 	if len(source) > 0 {
 		headers = source[0]
 	}
-	templates, _ := a.query(r.Context(), "SELECT t.id,t.name,v.variables FROM templates t JOIN template_versions v ON v.template_id=t.id AND v.version=t.current_version WHERE application_id=$1 ORDER BY name", scope)
+	templates, _ := a.query(r.Context(), "SELECT t.id,t.slug,t.name,v.variables FROM templates t JOIN template_versions v ON v.template_id=t.id AND v.version=t.current_version WHERE application_id=$1 ORDER BY name", scope)
 	selected := r.URL.Query().Get("template")
 	if selected == "" && len(templates) > 0 {
 		selected = templates[0]["id"].(string)
@@ -549,7 +588,31 @@ func (a *App) campaign(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	a.render(w, r, "campaign", map[string]any{"Campaign": data, "Rows": rows, "Headers": headers, "Scope": scope, "SheetConfigured": a.C.GoogleCredentials != "", "Templates": templates, "SelectedTemplate": selected, "TemplateVariables": variables})
+	mapping := Mapping{Email: -1, School: -1, Event: -1, Award: -1, URL: -1}
+	rawMapping, _ := json.Marshal(data["mapping"])
+	json.Unmarshal(rawMapping, &mapping)
+	if mapping.Email < 0 {
+		for i, h := range headers {
+			lower := strings.ToLower(h)
+			switch {
+			case strings.Contains(lower, "email") || strings.Contains(h, "อีเมล"):
+				mapping.Email = i
+			case strings.Contains(lower, "school") || h == "โรงเรียน":
+				mapping.School = i
+			case strings.Contains(lower, "certificate") || strings.Contains(lower, "url"):
+				mapping.URL = i
+			case strings.Contains(lower, "award") || h == "ประเภทเกียรติบัตร":
+				mapping.Award = i
+			case lower == "event":
+				mapping.Event = i
+			}
+		}
+	}
+	ruleSelections := map[string]string{}
+	for _, rule := range mapping.Rules {
+		ruleSelections[rule.Award] = rule.Template
+	}
+	a.render(w, r, "campaign", map[string]any{"Campaign": data, "Rows": rows, "Headers": headers, "Awards": sourceAwards(source), "Mapping": mapping, "RuleSelections": ruleSelections, "Scope": scope, "SheetConfigured": a.C.GoogleCredentials != "", "Templates": templates, "SelectedTemplate": selected, "TemplateVariables": variables})
 }
 func (a *App) campaignPreview(w http.ResponseWriter, r *http.Request) {
 	var scope, tid string
@@ -599,6 +662,11 @@ func (a *App) campaignProgress(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) replaceCampaignSource(ctx context.Context, id string, rows [][]string) error {
+	var validation error
+	rows, validation = normalizeImportRows(rows)
+	if validation != nil {
+		return validation
+	}
 	tx, e := a.DB.Begin(ctx)
 	if e != nil {
 		return e
@@ -612,7 +680,7 @@ func (a *App) replaceCampaignSource(ctx context.Context, id string, rows [][]str
 		return fmt.Errorf("only draft campaigns may be imported")
 	}
 	raw, _ := json.Marshal(rows)
-	if _, e = tx.Exec(ctx, "UPDATE campaigns SET source_rows=$2 WHERE id=$1", id, raw); e != nil {
+	if _, e = tx.Exec(ctx, "UPDATE campaigns SET source_rows=$2,mapping='{}' WHERE id=$1", id, raw); e != nil {
 		return e
 	}
 	if _, e = tx.Exec(ctx, "DELETE FROM campaign_rows WHERE campaign_id=$1", id); e != nil {
@@ -698,4 +766,24 @@ func (a *App) mapBulkCampaign(ctx context.Context, id, templateID string, emailC
 		}
 	}
 	return tx.Commit(ctx)
+}
+
+func sourceAwards(rows [][]string) []string {
+	if len(rows) == 0 {
+		return nil
+	}
+	column := -1
+	for i, h := range rows[0] {
+		if strings.Contains(strings.ToLower(h), "award") || h == "ประเภทเกียรติบัตร" {
+			column = i
+			break
+		}
+	}
+	var out []string
+	for _, r := range rows[1:] {
+		if v := cell(r, column); v != "" && !contains(out, v) {
+			out = append(out, v)
+		}
+	}
+	return out
 }

@@ -16,13 +16,16 @@ import (
 )
 
 var placeholders = regexp.MustCompile(`\{\{\s*([a-zA-Z][a-zA-Z0-9_]*)\s*\}\}`)
+var encodedPlaceholders = regexp.MustCompile(`(?i)%7b%7b(?:%20|\+)*([a-z][a-z0-9_]*)(?:%20|\+)*%7d%7d`)
 
 func cleanHTML(s string) string {
 	p := bluemonday.UGCPolicy()
 	p.AllowElements("table", "thead", "tbody", "tfoot", "tr", "td", "th", "div", "span", "center")
 	p.AllowAttrs("width", "height", "align", "valign", "cellpadding", "cellspacing", "border", "bgcolor").OnElements("table", "tr", "td", "th", "img", "div")
 	p.AllowStyles("color", "background-color", "font-family", "font-size", "font-weight", "font-style", "line-height", "text-align", "text-decoration", "padding", "padding-top", "padding-bottom", "padding-left", "padding-right", "margin", "margin-top", "margin-bottom", "margin-left", "margin-right", "width", "height", "max-width", "border", "border-radius", "border-collapse", "vertical-align").Globally()
-	return p.Sanitize(s)
+	// URL sanitization encodes braces in href/src. Retain template tokens after
+	// sanitization; rendered values are escaped, URL-checked, and sanitized again.
+	return encodedPlaceholders.ReplaceAllString(p.Sanitize(s), `{{$1}}`)
 }
 func plainHTML(s string) string {
 	z := xhtml.NewTokenizer(strings.NewReader(s))
@@ -209,8 +212,12 @@ func (a *App) Submit(ctx context.Context, in SendInput, key string) (string, boo
 	if e != nil {
 		return "", false, &HTTPError{400, e.Error()}
 	}
+	relayID, relayError := senderRelayWith(ctx, tx, from)
+	if relayError != nil {
+		return "", false, &HTTPError{400, relayError.Error()}
+	}
 	id := newID("msg_")
-	_, e = tx.Exec(ctx, `INSERT INTO messages(id,application_id,recipient,from_address,reply_to,subject,html,plain,class,idempotency_key,payload_hash,available_at,expires_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`, id, in.ApplicationID, in.To, from, reply, rendered.Subject, rendered.HTML, rendered.Plain, in.Class, key, fingerprint, scheduled, expires)
+	_, e = tx.Exec(ctx, `INSERT INTO messages(id,application_id,recipient,from_address,reply_to,subject,html,plain,class,idempotency_key,payload_hash,available_at,expires_at,relay_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NULLIF($14,''))`, id, in.ApplicationID, in.To, from, reply, rendered.Subject, rendered.HTML, rendered.Plain, in.Class, key, fingerprint, scheduled, expires, relayID)
 	if e != nil {
 		return "", false, e
 	}

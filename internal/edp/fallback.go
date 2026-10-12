@@ -36,8 +36,33 @@ func (a *App) queueFallback(ctx context.Context, tx pgx.Tx, id string) error {
 	if e != nil {
 		return e
 	}
-	if config.SecondarySMTPAddress == "" {
-		return nil
+	var from, relay string
+	if e = tx.QueryRow(ctx, "SELECT from_address,coalesce(relay_id,'') FROM messages WHERE id=$1", id).Scan(&from, &relay); e != nil {
+		return e
+	}
+	domain, domainError := senderDomain(from)
+	if domainError != nil {
+		return domainError
+	}
+	var fallback string
+	if relay != "" {
+		var domains []string
+		var enabled bool
+		e = tx.QueryRow(ctx, "SELECT r.id,r.allowed_domains,r.enabled FROM smtp_relays s JOIN smtp_relays r ON r.id=s.fallback_id WHERE s.id=$1 AND s.enabled AND $2=ANY(s.allowed_domains)", relay, domain).Scan(&fallback, &domains, &enabled)
+		if e == pgx.ErrNoRows {
+			return nil
+		}
+		if e != nil {
+			return e
+		}
+		if !enabled || !relayAllows(domains, domain) {
+			return nil
+		}
+	} else {
+		live, err := senderRelayWith(ctx, tx, from)
+		if err != nil || live != "" || config.SecondarySMTPAddress == "" {
+			return nil
+		}
 	}
 	var campaignID *string
 	var campaignState string
@@ -53,7 +78,7 @@ func (a *App) queueFallback(ctx context.Context, tx pgx.Tx, id string) error {
 		}
 	}
 
-	tag, e := tx.Exec(ctx, `UPDATE messages m SET route='secondary',secondary_used=true,status='queued',route_attempts=0,available_at=now(),lease_until=NULL,lease_token=NULL,relay_accepted_at=NULL,updated_at=now() FROM applications a WHERE m.id=$1 AND m.application_id=a.id AND a.fallback_enabled AND m.route='primary' AND NOT m.secondary_used AND m.failure_category='ip_reputation' AND m.status IN('failed','bounced') AND m.expires_at>now()`, id)
+	tag, e := tx.Exec(ctx, `UPDATE messages m SET route='secondary',fallback_relay_id=NULLIF($2,''),secondary_used=true,status='queued',route_attempts=0,available_at=now(),lease_until=NULL,lease_token=NULL,relay_accepted_at=NULL,updated_at=now() FROM applications a WHERE m.id=$1 AND m.application_id=a.id AND a.fallback_enabled AND m.route='primary' AND NOT m.secondary_used AND m.failure_category='ip_reputation' AND m.status IN('failed','bounced') AND m.expires_at>now()`, id, fallback)
 	if e != nil {
 		return e
 	}

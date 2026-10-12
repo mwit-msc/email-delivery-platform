@@ -19,8 +19,8 @@ import (
 )
 
 type delivery struct {
-	ID, AppID, Recipient, From, Reply, Subject, HTML, Plain, Lease, Route string
-	Attempts                                                              int
+	ID, AppID, Recipient, From, Reply, Subject, HTML, Plain, Lease, Route, RelayID, FallbackRelayID string
+	Attempts                                                                                        int
 }
 
 func (a *App) claim(ctx context.Context) (*delivery, error) {
@@ -49,7 +49,7 @@ func (a *App) claim(ctx context.Context) (*delivery, error) {
 		return nil, nil
 	}
 	d := &delivery{}
-	e = tx.QueryRow(ctx, `SELECT m.id,m.application_id,m.recipient,m.from_address,m.reply_to,m.subject,m.html,m.plain,m.route_attempts,m.route FROM messages m JOIN applications a ON a.id=m.application_id LEFT JOIN campaigns c ON c.id=m.campaign_id WHERE m.status IN('queued','retry_wait') AND m.available_at<=now() AND m.expires_at>now() AND NOT a.paused AND a.next_send_at<=now() AND (m.campaign_id IS NULL OR c.state='sending') ORDER BY CASE WHEN $1::bigint%5=4 AND m.class='bulk' THEN -1 ELSE CASE m.class WHEN 'otp' THEN 0 WHEN 'transactional' THEN 1 ELSE 2 END END,a.next_send_at,m.available_at,m.created_at FOR UPDATE OF m SKIP LOCKED LIMIT 1`, dispatchCounter).Scan(&d.ID, &d.AppID, &d.Recipient, &d.From, &d.Reply, &d.Subject, &d.HTML, &d.Plain, &d.Attempts, &d.Route)
+	e = tx.QueryRow(ctx, `SELECT m.id,m.application_id,m.recipient,m.from_address,m.reply_to,m.subject,m.html,m.plain,m.route_attempts,m.route,coalesce(m.relay_id,''),coalesce(m.fallback_relay_id,'') FROM messages m JOIN applications a ON a.id=m.application_id LEFT JOIN campaigns c ON c.id=m.campaign_id WHERE m.status IN('queued','retry_wait') AND m.available_at<=now() AND m.expires_at>now() AND NOT a.paused AND a.next_send_at<=now() AND (m.campaign_id IS NULL OR c.state='sending') ORDER BY CASE WHEN $1::bigint%5=4 AND m.class='bulk' THEN -1 ELSE CASE m.class WHEN 'otp' THEN 0 WHEN 'transactional' THEN 1 ELSE 2 END END,a.next_send_at,m.available_at,m.created_at FOR UPDATE OF m SKIP LOCKED LIMIT 1`, dispatchCounter).Scan(&d.ID, &d.AppID, &d.Recipient, &d.From, &d.Reply, &d.Subject, &d.HTML, &d.Plain, &d.Attempts, &d.Route, &d.RelayID, &d.FallbackRelayID)
 	if e == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -80,6 +80,7 @@ func (a *App) Work(ctx context.Context) error {
 		return e
 	}
 	go a.pmgLoop(ctx)
+	go a.webhookLoop(ctx)
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	maintenance := time.NewTicker(30 * time.Second)
@@ -174,6 +175,7 @@ func (a *App) maintenance(ctx context.Context) {
 	tx.Exec(ctx, "DELETE FROM oauth_states WHERE expires_at<now()")
 	tx.Exec(ctx, "DELETE FROM login_attempts WHERE expires_at<now()")
 	tx.Exec(ctx, "UPDATE messages SET html='',plain='' WHERE created_at<now()-$1::interval AND status NOT IN('queued','retry_wait','sending')", fmt.Sprintf("%d days", a.C.RetentionDays))
+	tx.Exec(ctx, "DELETE FROM webhook_jobs WHERE status NOT IN('queued','sending') AND created_at<now()-$1::interval", fmt.Sprintf("%d days", a.C.RetentionDays))
 	tx.Commit(ctx)
 }
 func makeMIME(d delivery, publicURL string) []byte {
@@ -218,7 +220,25 @@ func (a *App) smtpSend(ctx context.Context, d delivery) (string, string) {
 	if configErr != nil {
 		return "retry_wait", "Runtime configuration is unavailable"
 	}
+	liveRelay, routeError := a.senderRelay(ctx, d.From)
+	if routeError != nil {
+		return "failed", routeError.Error()
+	}
+	relay := liveRelay
 	if d.Route == "secondary" {
+		relay = d.FallbackRelayID
+	}
+	if relay != "" {
+		var err error
+		config, err = a.relayConfig(ctx, relay, d.From, config)
+		if err != nil {
+			return "failed", err.Error()
+		}
+
+	} else if d.Route == "secondary" {
+		if liveRelay != "" {
+			return "failed", "Sender domain requires its configured relay fallback"
+		}
 		if config.SecondarySMTPAddress == "" {
 			return "failed", "Secondary SMTP relay is not configured"
 		}
@@ -227,6 +247,13 @@ func (a *App) smtpSend(ctx context.Context, d delivery) (string, string) {
 		config.SMTPPassword = config.SecondarySMTPPassword
 		config.SMTPTLS = config.SecondarySMTPTLS
 	}
+
+	if d.Route != "secondary" {
+		if _, err := a.DB.Exec(ctx, "UPDATE messages SET relay_id=NULLIF($3,'') WHERE id=$1 AND lease_token=$2 AND status='sending'", d.ID, d.Lease, relay); err != nil {
+			return "retry_wait", "Could not persist relay selection"
+		}
+	}
+
 	host, _, e := net.SplitHostPort(config.SMTPAddress)
 	if e != nil {
 		return "failed", "invalid SMTP address"
@@ -263,11 +290,15 @@ func (a *App) smtpSend(ctx context.Context, d delivery) (string, string) {
 			return smtpFailure(e, false)
 		}
 	}
+	domain, domainError := senderDomain(d.From)
+	if domainError != nil {
+		return "failed", domainError.Error()
+	}
 	// Recheck suspension immediately before crossing the SMTP boundary.
 	var allowed bool
-	e = a.DB.QueryRow(ctx, `SELECT NOT p.paused AND NOT a.paused AND m.status='sending' AND m.lease_token=$2 AND m.expires_at>now() AND (m.campaign_id IS NULL OR c.state='sending') FROM messages m JOIN applications a ON a.id=m.application_id CROSS JOIN platform_settings p LEFT JOIN campaigns c ON c.id=m.campaign_id WHERE m.id=$1 AND p.id=1`, d.ID, d.Lease).Scan(&allowed)
+	e = a.DB.QueryRow(ctx, `SELECT NOT p.paused AND NOT a.paused AND m.status='sending' AND m.lease_token=$2 AND m.expires_at>now() AND (m.campaign_id IS NULL OR c.state='sending') AND (m.route<>'secondary' OR a.fallback_enabled) AND (m.route<>'secondary' OR coalesce(m.relay_id,'')=coalesce((SELECT relay_id FROM sender_domain_routes WHERE domain=$3),'')) AND (m.route<>'primary' OR $4=coalesce((SELECT relay_id FROM sender_domain_routes WHERE domain=$3),'')) AND (m.route<>'secondary' OR m.relay_id IS NULL OR EXISTS(SELECT 1 FROM smtp_relays s WHERE s.id=m.relay_id AND s.enabled AND $3=ANY(s.allowed_domains) AND s.fallback_id=$4)) AND (NOT p.strict_sender_domains OR EXISTS(SELECT 1 FROM sender_domain_routes dr JOIN smtp_relays sr ON sr.id=dr.relay_id WHERE dr.domain=$3 AND sr.enabled AND $3=ANY(sr.allowed_domains))) AND ($4='' OR EXISTS(SELECT 1 FROM smtp_relays sr WHERE sr.id=$4 AND sr.enabled AND $3=ANY(sr.allowed_domains))) FROM messages m JOIN applications a ON a.id=m.application_id CROSS JOIN platform_settings p LEFT JOIN campaigns c ON c.id=m.campaign_id WHERE m.id=$1 AND p.id=1`, d.ID, d.Lease, domain, relay).Scan(&allowed)
 	if e != nil || !allowed {
-		return "retry_wait", "Dispatch paused or expired before SMTP submission"
+		return "retry_wait", "Dispatch paused, expired, or relay routing changed before SMTP submission"
 	}
 	envelope := d.From
 	if config.BounceDomain != "" {

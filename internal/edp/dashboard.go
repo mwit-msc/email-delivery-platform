@@ -191,70 +191,23 @@ func (a *App) editorData(w http.ResponseWriter, r *http.Request) {
 		respond(w, 200, data)
 		return
 	}
-	var in struct {
-		Subject, HTML, Plain string
-		Project              json.RawMessage
-		Version              int
-	}
-	if e = json.NewDecoder(r.Body).Decode(&in); e != nil || len(in.HTML) > 2<<20 || len(in.Subject) > 998 || in.Subject == "" || strings.ContainsAny(in.Subject, "\r\n") {
-		problem(w, 400, "invalid template content")
+	var in TemplateInput
+	if !decodeAPI(w, r, &in) {
 		return
 	}
-	if len(in.Project) == 0 {
-		in.Project = json.RawMessage(`{}`)
-	}
-	if !json.Valid(in.Project) {
-		problem(w, 400, "invalid editor project")
-		return
-	}
-	if len(in.Project) > 2<<20 {
-		problem(w, 400, "editor project exceeds 2 MiB")
-		return
-	}
-	if in.Project, e = cleanProject(in.Project); e != nil {
-		problem(w, 400, "invalid editor project")
-		return
-	}
-	in.HTML = cleanHTML(in.HTML)
-	if in.Plain == "" {
-		in.Plain = plainHTML(in.HTML)
-	}
-	vars := []string{}
-	for _, match := range placeholders.FindAllStringSubmatch(in.Subject+in.HTML+in.Plain, -1) {
-		if !contains(vars, match[1]) {
-			vars = append(vars, match[1])
+	version, vars, e := a.saveTemplateVersion(r.Context(), data["application_id"].(string), id, in)
+	if e != nil {
+		status := 400
+		if strings.Contains(e.Error(), "another session") {
+			status = 409
 		}
-	}
-	tx, e := a.DB.Begin(r.Context())
-	if e != nil {
-		problem(w, 500, "could not save template")
+		problem(w, status, e.Error())
 		return
 	}
-	defer tx.Rollback(r.Context())
-	var current int
-	e = tx.QueryRow(r.Context(), "SELECT current_version FROM templates WHERE id=$1 FOR UPDATE", id).Scan(&current)
-	if e != nil {
-		problem(w, 500, "could not load template version")
-		return
-	}
-	if current != in.Version {
-		problem(w, 409, "template changed in another session; reload before saving")
-		return
-	}
-	_, e = tx.Exec(r.Context(), "INSERT INTO template_versions(template_id,version,subject,html,plain,variables,project) VALUES($1,$2,$3,$4,$5,$6,$7)", id, current+1, in.Subject, in.HTML, in.Plain, vars, []byte(in.Project))
-	if e == nil {
-		_, e = tx.Exec(r.Context(), "UPDATE templates SET current_version=$2 WHERE id=$1", id, current+1)
-	}
-	if e == nil {
-		e = tx.Commit(r.Context())
-	}
-	if e != nil {
-		problem(w, 500, "template could not be saved")
-		return
-	}
-	a.audit(r.Context(), person(r).ID, "template.version", data["application_id"].(string), id+":"+strconv.Itoa(current+1))
-	respond(w, 200, map[string]any{"version": current + 1, "variables": vars})
+	a.audit(r.Context(), person(r).ID, "template.version", data["application_id"].(string), id+":"+strconv.Itoa(version))
+	respond(w, 200, map[string]any{"version": version, "variables": vars})
 }
+
 func (a *App) access(w http.ResponseWriter, r *http.Request) {
 	if !a.require(w, r, "*", "platform.manage") {
 		return

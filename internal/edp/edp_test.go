@@ -272,7 +272,7 @@ func TestPlatformIntegration(t *testing.T) {
 	})
 	t.Run("campaign approval and resume", func(t *testing.T) {
 		a.DB.Exec(ctx, "INSERT INTO campaigns(id,application_id,name,created_by,source_rows) VALUES('campaign-test','app_demo','Certificates',$1,$2)", rootID, []byte(`[["email","school","link"],["school@example.test","Example School","https://drive.google.com/example"]]`))
-		if e := a.mapCampaign(ctx, "campaign-test", Mapping{0, 1, -1, -1, 2, "square", "participation"}); e != nil {
+		if e := a.mapCampaign(ctx, "campaign-test", Mapping{Email: 0, School: 1, Event: -1, Award: -1, URL: 2, DefaultEvent: "square", DefaultAward: "participation"}); e != nil {
 			t.Fatal(e)
 		}
 		if e := a.approveCampaign(ctx, "campaign-test", rootID); e != nil {
@@ -342,7 +342,7 @@ func TestCampaignMutationsRemainFrozen(t *testing.T) {
 	if e := a.replaceCampaignSource(ctx, "frozen", rows); e != nil {
 		t.Fatal(e)
 	}
-	if e := a.mapCampaign(ctx, "frozen", Mapping{0, 1, -1, -1, 2, "square", "participation"}); e != nil {
+	if e := a.mapCampaign(ctx, "frozen", Mapping{Email: 0, School: 1, Event: -1, Award: -1, URL: 2, DefaultEvent: "square", DefaultAward: "participation"}); e != nil {
 		t.Fatal(e)
 	}
 	var rowID string
