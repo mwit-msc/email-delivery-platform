@@ -1,0 +1,38 @@
+name: edp
+x-app: &app
+  image: ${EDP_IMAGE:?Set EDP_IMAGE to a versioned GHCR image}
+  env_file: .env.production
+  volumes:
+    - ./secrets:/run/secrets:ro
+  restart: unless-stopped
+services:
+  migrate:
+    <<: *app
+    command: [migrate]
+    restart: "no"
+  seed:
+    <<: *app
+    command: [seed]
+    restart: "no"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+  web:
+    <<: *app
+    command: [serve]
+    ports:
+      - 127.0.0.1:8080:8080
+    healthcheck:
+      test: [CMD, wget, -q, --spider, http://127.0.0.1:8080/healthz]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+  worker:
+    <<: *app
+    command: [worker]
+    depends_on:
+      seed:
+        condition: service_completed_successfully

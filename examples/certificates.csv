@@ -1,0 +1,4 @@
+email,school_name,event,award,certificate_url
+teacher-one@example.test,Example School One,example,participation,https://certificates.example.test/one
+teacher-two@example.test,Example School Two,example,participation,https://certificates.example.test/two
+teacher-three@example.test,Example School Three,example,participation,https://certificates.example.test/three

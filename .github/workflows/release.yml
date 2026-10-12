@@ -1,0 +1,122 @@
+name: Release container
+on:
+  push:
+    branches: [release]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: edp-release
+  cancel-in-progress: false
+jobs:
+  release:
+    if: github.ref == 'refs/heads/release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: edp
+          POSTGRES_PASSWORD: test-password
+          POSTGRES_DB: edp_test
+        ports: [5432:5432]
+        options: >-
+          --health-cmd "pg_isready -U edp -d edp_test"
+          --health-interval 5s --health-timeout 3s --health-retries 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go vet ./...
+      - run: go test -race ./... -count=1
+        env:
+          EDP_TEST_DATABASE_URL: postgres://edp:test-password@localhost:5432/edp_test?sslmode=disable
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      - name: Determine version and image name
+        id: version
+        shell: bash
+        run: |
+          version="$(python3 scripts/release-version.py)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Preserve published versions and protect the release alias
+        id: preflight
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          IMAGE: ${{ steps.version.outputs.image }}
+        shell: bash
+        run: |
+          if git rev-parse "refs/tags/$VERSION" >/dev/null 2>&1; then
+            test "$(git rev-list -n 1 "$VERSION")" = "$GITHUB_SHA" || { echo 'Version tag belongs to another commit'; exit 1; }
+          fi
+          published=false
+          if docker buildx imagetools inspect "$IMAGE:$VERSION" > /tmp/edp-image.txt 2>/dev/null; then
+            revision="$(docker buildx imagetools inspect --raw "$IMAGE:$VERSION" | jq -r '.annotations["org.opencontainers.image.revision"]')"
+            test "$revision" = "$GITHUB_SHA" || { echo 'Existing container version belongs to another commit'; exit 1; }
+            published=true
+            digest="$(awk '/^Digest:/ {print $2; exit}' /tmp/edp-image.txt)"
+            echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          fi
+          current="$(git ls-remote origin refs/heads/release | cut -f1)"
+          echo "published=$published" >> "$GITHUB_OUTPUT"
+          echo "current=$([ "$current" = "$GITHUB_SHA" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          {
+            echo 'tags<<EDP_TAGS'
+            echo "$IMAGE:$VERSION"
+            echo "$IMAGE:sha-$GITHUB_SHA"
+            if [ "$current" = "$GITHUB_SHA" ]; then echo "$IMAGE:release"; fi
+            echo 'EDP_TAGS'
+          } >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        id: build
+        if: steps.preflight.outputs.published != 'true'
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          build-args: VERSION=${{ steps.version.outputs.version }}
+          tags: ${{ steps.preflight.outputs.tags }}
+          annotations: index:org.opencontainers.image.revision=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+      - name: Restore current release alias without rebuilding an existing version
+        if: steps.preflight.outputs.published == 'true' && steps.preflight.outputs.current == 'true'
+        env:
+          IMAGE: ${{ steps.version.outputs.image }}
+          DIGEST: ${{ steps.preflight.outputs.digest }}
+        run: docker buildx imagetools create --tag "$IMAGE:release" "$IMAGE@$DIGEST"
+      - name: Create version tag and GitHub release after publishing
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+          IMAGE: ${{ steps.version.outputs.image }}
+          DIGEST: ${{ steps.build.outputs.digest || steps.preflight.outputs.digest }}
+        shell: bash
+        run: |
+          if ! git rev-parse "refs/tags/$VERSION" >/dev/null 2>&1; then
+            git tag "$VERSION" "$GITHUB_SHA"
+            git push origin "refs/tags/$VERSION"
+          fi
+          if ! gh release view "$VERSION" >/dev/null 2>&1; then
+            printf 'Container: `%s:%s`\n\nDigest: `%s`\n\nPlatform: linux/amd64.\n' "$IMAGE" "$VERSION" "$DIGEST" > /tmp/edp-release-notes.md
+            gh release create "$VERSION" --verify-tag --title "$VERSION" --notes-file /tmp/edp-release-notes.md
+          fi

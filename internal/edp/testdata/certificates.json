@@ -1,0 +1,1 @@
+[{"event":"square","award":"participation","label":"Sample certificate notification","subject":"Certificate for {{school_name}}","html":"<p>Hello {{school_name}},</p><p>Your certificate: <a href=\"{{certificate_url}}\">Download</a></p>","text":"Hello {{school_name}}. Download: {{certificate_url}}"}]

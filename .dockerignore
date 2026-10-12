@@ -1,0 +1,25 @@
+.git
+.env
+.env.*
+secrets
+edp
+coverage.out
+*.log
+.github
+
+backups
+
+examples/mwit
+
+# Private deployment files and internal notes.
+local/
+private/
+planning/
+internal-planning/
+*.dump
+*.pem
+*.key
+*.p12
+*.pfx
+*.sqlite
+*.sqlite3

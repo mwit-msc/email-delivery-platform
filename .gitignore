@@ -1,0 +1,31 @@
+.env
+.env.*
+!.env.example
+!.env.production.example
+secrets/
+/edp
+/coverage.out
+*.log
+*.db
+.DS_Store
+
+backups/
+scripts/__pycache__/
+
+# Organization-specific examples are local inputs, not generic distributions.
+/examples/mwit/
+
+*.db-*
+
+# Private deployment files and internal notes.
+local/
+private/
+planning/
+internal-planning/
+*.dump
+*.pem
+*.key
+*.p12
+*.pfx
+*.sqlite
+*.sqlite3

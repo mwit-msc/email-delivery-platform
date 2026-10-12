@@ -1,0 +1,99 @@
+openapi: 3.1.0
+info:
+  title: Email Delivery Platform
+  version: 1.0.0
+security:
+  - serviceKey: []
+components:
+  securitySchemes:
+    serviceKey:
+      type: http
+      scheme: bearer
+  schemas:
+    Message:
+      type: object
+      required: [to, template, variables]
+      properties:
+        to: {type: string, format: email}
+        template: {type: string}
+        template_version: {type: integer, minimum: 1}
+        variables: {type: object, additionalProperties: {type: string}}
+        class: {type: string, enum: [transactional, otp], default: transactional}
+        schedule_at: {type: string, format: date-time}
+        expires_at: {type: string, format: date-time}
+      additionalProperties: false
+paths:
+  /v1/messages:
+    post:
+      operationId: submitMessage
+      summary: Persist a message for asynchronous delivery
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: true
+          schema: {type: string, maxLength: 200}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Message'}
+      responses:
+        '202': {description: Durably accepted or replayed, with id and status_url}
+        '400': {description: Invalid message or missing template variables}
+        '401': {description: Service key missing or invalid}
+        '403': {description: Scope denied}
+        '409': {description: Conflicting idempotency payload or paused application}
+        '429': {description: Quota or queue capacity exceeded; no message persisted}
+        '503': {description: Platform admission paused}
+  /v1/messages/{id}:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: {type: string}
+    get:
+      operationId: getMessage
+      summary: Read an application's message delivery status
+      responses:
+        '200': {description: Message status and attempt count}
+        '401': {description: Authentication required}
+        '403': {description: Key cannot read this application's messages}
+        '404': {description: Message not found}
+  /v1/messages/{id}/cancel:
+    parameters:
+      - in: path
+        name: id
+        required: true
+        schema: {type: string}
+    post:
+      operationId: cancelMessage
+      summary: Cancel before the SMTP dispatch boundary
+      responses:
+        '200': {description: Cancelled}
+        '401': {description: Authentication required}
+        '403': {description: Cancellation scope denied}
+        '404': {description: Message not found}
+        '409': {description: Already in flight or terminal}
+  /v1/delivery-events:
+    post:
+      operationId: reportDelivery
+      summary: Ingest trusted, deduplicated gateway transport feedback
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [message_id, status, event_key]
+              properties:
+                message_id: {type: string}
+                status: {type: string, enum: [remote_accepted, bounced]}
+                event_key: {type: string, maxLength: 200}
+                detail: {type: string, maxLength: 512}
+      responses:
+        '200': {description: Recorded or replayed}
+        '400': {description: Invalid report}
+        '401': {description: Authentication required}
+        '403': {description: Reporting scope denied}
+        '404': {description: Message outside application or not found}
+        '409': {description: Invalid message state or conflicting event key}

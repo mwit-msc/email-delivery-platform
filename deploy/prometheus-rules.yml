@@ -1,0 +1,24 @@
+groups:
+  - name: edp
+    rules:
+      - alert: EDPQueueDelay
+        expr: edp_queue_oldest_seconds > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: EDP has mail waiting longer than five minutes
+      - alert: EDPUncertainDelivery
+        expr: edp_messages{status="unknown"} > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: EDP requires gateway confirmation for an uncertain SMTP outcome
+      - alert: EDPUnavailable
+        expr: up{job="edp"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: EDP monitoring endpoint is unavailable

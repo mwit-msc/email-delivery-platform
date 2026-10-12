@@ -1,0 +1,99 @@
+name: edp-local
+x-app: &app
+  build:
+    context: .
+  image: edp:local
+  environment: &app-env
+    EDP_ENV: development
+    DATABASE_URL: postgres://edp:edp-local-only@postgres:5432/edp?sslmode=disable
+    PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
+    SECRET_KEY: ${SECRET_KEY:?Run scripts/dev-init.sh first}
+    ROOT_USERNAME: ${ROOT_USERNAME:-root}
+    ROOT_PASSWORD: ${ROOT_PASSWORD:?Run scripts/dev-init.sh first}
+    ROOT_PASSWORD_HASH: ${ROOT_PASSWORD_HASH:-}
+    SMTP_ADDR: mailpit:1025
+    SMTP_TLS: none
+    OIDC_ISSUER: ${OIDC_ISSUER:-}
+    OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:-}
+    OIDC_SCOPES: ${OIDC_SCOPES:-openid profile email groups offline_access}
+    OIDC_GROUPS_CLAIM: ${OIDC_GROUPS_CLAIM:-groups}
+    OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+    GOOGLE_CREDENTIALS_FILE: ${GOOGLE_CREDENTIALS_FILE:-}
+    RETENTION_DAYS: 30
+    OIDC_PROVIDER_NAME: ${OIDC_PROVIDER_NAME:-Single sign-on}
+    SEED_CERTIFICATES_FILE: ${SEED_CERTIFICATES_FILE:-}
+    SEED_LOGO_FILE: ${SEED_LOGO_FILE:-}
+    METRICS_TOKEN: ${METRICS_TOKEN:-}
+    BOUNCE_DOMAIN: ${BOUNCE_DOMAIN:-}
+    PMG_URL: ${PMG_URL:-}
+    PMG_USERNAME: ${PMG_USERNAME:-}
+    PMG_PASSWORD: ${PMG_PASSWORD:-}
+    PMG_NODES: ${PMG_NODES:-}
+    PMG_CA_FILE: ${PMG_CA_FILE:-}
+    SECONDARY_SMTP_ADDR: ${SECONDARY_SMTP_ADDR:-}
+    SECONDARY_SMTP_TLS: ${SECONDARY_SMTP_TLS:-starttls}
+    SECONDARY_SMTP_USERNAME: ${SECONDARY_SMTP_USERNAME:-}
+    SECONDARY_SMTP_PASSWORD: ${SECONDARY_SMTP_PASSWORD:-}
+  volumes:
+    - ./secrets:/run/secrets:ro
+    - ./examples:/run/demo:ro
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: edp
+      POSTGRES_USER: edp
+      POSTGRES_PASSWORD: edp-local-only
+    ports:
+      - 127.0.0.1:15432:5432
+    volumes:
+      - postgres-data:/var/lib/postgresql
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U edp -d edp]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+  mailpit:
+    image: axllent/mailpit@sha256:94f6b70c1436defae6799d9ac7ff0eeff9540465b842026d5cdb018f1c0234ea
+    ports:
+      - 127.0.0.1:8025:8025
+    healthcheck:
+      test: [CMD, /mailpit, readyz]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+  migrate:
+    <<: *app
+    command: [migrate]
+    depends_on:
+      postgres:
+        condition: service_healthy
+  seed:
+    <<: *app
+    command: [seed-demo]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+  web:
+    <<: *app
+    command: [serve]
+    ports:
+      - 127.0.0.1:8080:8080
+    healthcheck:
+      test: [CMD, wget, -q, --spider, http://127.0.0.1:8080/healthz]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+  worker:
+    <<: *app
+    command: [worker]
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+      mailpit:
+        condition: service_healthy
+volumes:
+  postgres-data:
