@@ -190,7 +190,7 @@ func makeMIME(d delivery, publicURL string) []byte {
 		fmt.Fprintf(&b, "Reply-To: %s\r\n", d.Reply)
 	}
 	b.WriteString("\r\n")
-	for _, part := range []struct{ Type, Body string }{{"text/plain", d.Plain}, {"text/html", d.HTML}} {
+	for _, part := range []struct{ Type, Body string }{{"text/plain", d.Plain}, {"text/html", emailDocument(d.HTML, publicURL)}} {
 		h := textproto.MIMEHeader{}
 		h.Set("Content-Type", part.Type+"; charset=utf-8")
 		h.Set("Content-Transfer-Encoding", "base64")

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Email Delivery Platform
-  version: 1.1.1
+  version: 1.2.0
   description: Application-scoped bearer API for durable delivery, templates, campaigns, assets, and webhooks.
     relay.manage is a privileged platform-wide permission. Expanded API operations reject unknown JSON
     fields and multiple JSON values.
@@ -115,6 +115,10 @@ components:
           type: string
         plain:
           type: string
+        document:
+          type: string
+          description: Full sanitized HTML document with application-owned font loading. Use for browser
+            preview; html remains the editable fragment. Email clients may use system font fallbacks.
       additionalProperties: false
       required:
       - subject
@@ -132,6 +136,14 @@ components:
         template:
           type: string
           description: Template slug or ID in this application.
+        variables:
+          type: object
+          maxProperties: 64
+          additionalProperties:
+            type: string
+            maxLength: 4096
+          description: Text variables for this award. Override mapping constants and columns; escaped
+            during rendering. Lets several awards share one template.
       additionalProperties: false
       required:
       - award
@@ -196,7 +208,7 @@ components:
       - url
       description: Certificate mapping. An empty event/award cell uses its default. Without a matching
         rule, template slug is event.award. Supplies school_name and certificate_url automatically. Additional
-        columns override constants of the same name.
+        columns override constants of the same name. Matching award-rule variables override both.
     BulkMapping:
       type: object
       properties:
@@ -596,7 +608,13 @@ paths:
     get:
       operationId: listTemplates
       summary: List current templates in this application
-      description: Requires template.view.
+      description: Requires template.view. Archived templates are hidden by default.
+      parameters:
+      - in: query
+        name: include_archived
+        schema:
+          type: boolean
+          default: false
       responses:
         '200':
           description: Success
@@ -1431,3 +1449,49 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/RelayRouting'
+  /v1/templates/{id}/archive:
+    parameters:
+    - name: id
+      in: path
+      required: true
+      schema:
+        type: string
+    post:
+      operationId: setTemplateArchived
+      summary: Archive or restore a template
+      description: Requires template.edit in this application. Hides templates from default lists and
+        new campaign pickers without deleting versions, changing existing campaigns, or disabling
+        rendering by ID or slug. Set archived to false to restore.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [archived]
+              properties:
+                archived:
+                  type: boolean
+      responses:
+        '200':
+          description: Archive state saved
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [id, archived]
+                properties:
+                  id:
+                    type: string
+                  archived:
+                    type: boolean
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Template not found in this application

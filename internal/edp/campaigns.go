@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -166,9 +167,29 @@ type Mapping struct {
 }
 
 type AwardRule struct {
-	Event    string `json:"event"`
-	Award    string `json:"award"`
-	Template string `json:"template"`
+	Event     string            `json:"event"`
+	Award     string            `json:"award"`
+	Template  string            `json:"template"`
+	Variables map[string]string `json:"variables,omitempty"`
+}
+
+var variableName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_]{0,99}$`)
+
+func selectedAwardRule(rules []AwardRule, event, award string) *AwardRule {
+	var generic *AwardRule
+	for i := range rules {
+		rule := &rules[i]
+		if rule.Award != award {
+			continue
+		}
+		if rule.Event == event {
+			return rule
+		}
+		if rule.Event == "" {
+			generic = rule
+		}
+	}
+	return generic
 }
 
 func cell(row []string, n int) string {
@@ -188,6 +209,14 @@ func (a *App) mapCampaign(ctx context.Context, id string, m Mapping) error {
 			return fmt.Errorf("award rules require a unique event/award and template")
 		}
 		seenRules[key] = true
+		if len(rule.Variables) > 64 {
+			return fmt.Errorf("at most 64 variables per award rule")
+		}
+		for key, value := range rule.Variables {
+			if !variableName.MatchString(key) || len(value) > 4096 {
+				return fmt.Errorf("invalid award variable name or value size")
+			}
+		}
 	}
 	tx, e := a.DB.Begin(ctx)
 	if e != nil {
@@ -241,22 +270,9 @@ func (a *App) mapCampaign(ctx context.Context, id string, m Mapping) error {
 		var tid string
 		var v int
 		slug := event + "." + award
-		genericTemplate := ""
-		for _, rule := range m.Rules {
-			if rule.Award != award {
-				continue
-			}
-			if rule.Event == event {
-				slug = rule.Template
-				genericTemplate = ""
-				break
-			}
-			if rule.Event == "" {
-				genericTemplate = rule.Template
-			}
-		}
-		if genericTemplate != "" {
-			slug = genericTemplate
+		rule := selectedAwardRule(m.Rules, event, award)
+		if rule != nil {
+			slug = rule.Template
 		}
 		err = tx.QueryRow(ctx, "SELECT id,current_version FROM templates WHERE application_id=$1 AND (slug=$2 OR id=$2)", app, slug).Scan(&tid, &v)
 		if err != nil {
@@ -272,6 +288,11 @@ func (a *App) mapCampaign(ctx context.Context, id string, m Mapping) error {
 		for k, column := range m.Columns {
 			if column >= 0 {
 				vars[k] = cell(row, column)
+			}
+		}
+		if rule != nil {
+			for key, value := range rule.Variables {
+				vars[key] = value
 			}
 		}
 		if tpl != nil {
@@ -528,9 +549,24 @@ func (a *App) campaign(w http.ResponseWriter, r *http.Request) {
 				e = a.mapBulkCampaign(r.Context(), id, r.FormValue("template"), parse("email"), columns, constants)
 			} else {
 				m := Mapping{Email: parse("email"), School: parse("school"), Event: parse("event"), Award: parse("award"), URL: parse("url"), DefaultEvent: r.FormValue("default_event"), DefaultAward: r.FormValue("default_award"), SkipRowsWithoutEmail: r.FormValue("skip_empty_email") == "on"}
+				// Certificate forms do not expose API column/constant mappings.
+				// Retain these values when an organizer changes an award selection.
+				var previous Mapping
+				stored, _ := json.Marshal(data["mapping"])
+				if json.Unmarshal(stored, &previous) == nil {
+					m.Columns, m.Constants = previous.Columns, previous.Constants
+				}
 				for key := range r.Form {
 					if strings.HasPrefix(key, "rule.") && r.FormValue(key) != "" {
-						m.Rules = append(m.Rules, AwardRule{Award: strings.TrimPrefix(key, "rule."), Template: r.FormValue(key)})
+						award := strings.TrimPrefix(key, "rule.")
+						rule := AwardRule{Award: award, Template: r.FormValue(key)}
+						if raw := strings.TrimSpace(r.FormValue("rule_vars." + award)); raw != "" {
+							if err := json.Unmarshal([]byte(raw), &rule.Variables); err != nil {
+								problem(w, 400, "award variables must be a JSON object of text values")
+								return
+							}
+						}
+						m.Rules = append(m.Rules, rule)
 					}
 				}
 				e = a.mapCampaign(r.Context(), id, m)
@@ -571,7 +607,7 @@ func (a *App) campaign(w http.ResponseWriter, r *http.Request) {
 	if len(source) > 0 {
 		headers = source[0]
 	}
-	templates, _ := a.query(r.Context(), "SELECT t.id,t.slug,t.name,v.variables FROM templates t JOIN template_versions v ON v.template_id=t.id AND v.version=t.current_version WHERE application_id=$1 ORDER BY name", scope)
+	templates, _ := a.query(r.Context(), "SELECT t.id,t.slug,t.name,v.variables FROM templates t JOIN template_versions v ON v.template_id=t.id AND v.version=t.current_version WHERE application_id=$1 AND NOT t.archived ORDER BY name", scope)
 	selected := r.URL.Query().Get("template")
 	if selected == "" && len(templates) > 0 {
 		selected = templates[0]["id"].(string)
@@ -609,10 +645,15 @@ func (a *App) campaign(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	ruleSelections := map[string]string{}
+	ruleVariables := map[string]string{}
 	for _, rule := range mapping.Rules {
 		ruleSelections[rule.Award] = rule.Template
+		if len(rule.Variables) > 0 {
+			raw, _ := json.Marshal(rule.Variables)
+			ruleVariables[rule.Award] = string(raw)
+		}
 	}
-	a.render(w, r, "campaign", map[string]any{"Campaign": data, "Rows": rows, "Headers": headers, "Awards": sourceAwards(source), "Mapping": mapping, "RuleSelections": ruleSelections, "Scope": scope, "SheetConfigured": a.C.GoogleCredentials != "", "Templates": templates, "SelectedTemplate": selected, "TemplateVariables": variables})
+	a.render(w, r, "campaign", map[string]any{"Campaign": data, "Rows": rows, "Headers": headers, "Awards": sourceAwards(source), "Mapping": mapping, "RuleSelections": ruleSelections, "RuleVariables": ruleVariables, "Scope": scope, "SheetConfigured": a.C.GoogleCredentials != "", "Templates": templates, "SelectedTemplate": selected, "TemplateVariables": variables})
 }
 func (a *App) campaignPreview(w http.ResponseWriter, r *http.Request) {
 	var scope, tid string
@@ -633,9 +674,14 @@ func (a *App) campaignPreview(w http.ResponseWriter, r *http.Request) {
 		problem(w, 400, e.Error())
 		return
 	}
-	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'; img-src https: http: data:; style-src 'unsafe-inline'")
+	config, e := a.runtimeConfig(r.Context())
+	if e != nil {
+		problem(w, 503, "preview configuration unavailable")
+		return
+	}
+	w.Header().Set("Content-Security-Policy", emailPreviewCSP())
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Write([]byte(rendered.HTML))
+	w.Write([]byte(emailDocument(rendered.HTML, config.PublicURL)))
 }
 
 func (a *App) campaignProgress(w http.ResponseWriter, r *http.Request) {

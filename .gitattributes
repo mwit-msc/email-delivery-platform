@@ -1,0 +1,3 @@
+# Keep the pinned Scalar bundle byte-for-byte identical to its upstream asset.
+# Its generated template literals contain intentional trailing whitespace.
+internal/edp/web/assets/scalar-1.74.0.js -whitespace

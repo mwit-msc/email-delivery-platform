@@ -148,6 +148,10 @@ func (a *App) Handler() http.Handler {
 	mux := http.NewServeMux()
 	assets, _ := fs.Sub(resources, "web/assets")
 	mux.Handle("GET /assets/", http.StripPrefix("/assets/", http.FileServerFS(assets)))
+	mux.HandleFunc("GET /assets/NotoSansThai.ttf", serveEmailFont)
+	for _, path := range []string{"/docs", "/openapi.yaml", "/llms.txt", "/llms-full.txt"} {
+		mux.HandleFunc("GET "+path, a.docs)
+	}
 	mux.HandleFunc("GET /demo/logo.png", func(w http.ResponseWriter, r *http.Request) {
 		if a.C.SeedLogoFile == "" {
 			http.NotFound(w, r)
@@ -213,12 +217,14 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /applications/{id}/workbook-sheets", a.workbookSheets)
 	mux.HandleFunc("GET /email-assets/{id}", a.emailAsset)
 	mux.HandleFunc("POST /templates/{id}/preview", a.previewTemplate)
+	mux.HandleFunc("POST /templates/{id}/archive", a.archiveTemplate)
 	mux.HandleFunc("GET /campaigns/{id}/export", a.campaignExport)
 	mux.HandleFunc("GET /v1/templates", a.apiTemplates)
 	mux.HandleFunc("POST /v1/templates", a.apiTemplates)
 	mux.HandleFunc("GET /v1/templates/{id}", a.apiTemplate)
 	mux.HandleFunc("PUT /v1/templates/{id}", a.apiTemplate)
 	mux.HandleFunc("POST /v1/templates/{id}/preview", a.previewTemplate)
+	mux.HandleFunc("POST /v1/templates/{id}/archive", a.archiveTemplate)
 	mux.HandleFunc("POST /v1/assets", a.uploadEmailAsset)
 	mux.HandleFunc("POST /v1/imports/workbook-sheets", a.apiWorkbookSheets)
 	mux.HandleFunc("GET /v1/campaigns", a.apiCampaigns)
@@ -614,6 +620,11 @@ func (a *App) messagePreview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'; img-src https: http: data:; style-src 'unsafe-inline'")
-	w.Write([]byte(content))
+	config, e := a.runtimeConfig(r.Context())
+	if e != nil {
+		problem(w, 503, "preview configuration unavailable")
+		return
+	}
+	w.Header().Set("Content-Security-Policy", emailPreviewCSP())
+	w.Write([]byte(emailDocument(content, config.PublicURL)))
 }

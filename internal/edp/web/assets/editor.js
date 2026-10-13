@@ -16,7 +16,7 @@ window.edpInitEditor = async function(container, signal) {
     const data = await response.json();
     if (signal.aborted || !container.isConnected) return;
     let version = data.current_version;
-    editor = grapesjs.init({container:find('#grapes-editor'),height:'100%',storageManager:false,fromElement:false,plugins:['grapesjs-preset-newsletter'],pluginsOpts:{'grapesjs-preset-newsletter':{useCustomTheme:false}},assetManager:{upload:false},allowScripts:false,canvas:{scripts:[]}});
+    editor = grapesjs.init({container:find('#grapes-editor'),height:'100%',storageManager:false,fromElement:false,plugins:['grapesjs-preset-newsletter'],pluginsOpts:{'grapesjs-preset-newsletter':{useCustomTheme:false}},assetManager:{upload:false},allowScripts:false,canvas:{scripts:[],styles:['/assets/email-fonts.css']}});
     if (data.project&&Object.keys(data.project).length) editor.loadProjectData(data.project);
     else editor.setComponents(data.html);
     status.textContent='Drag blocks into the message. Saved versions remain available to approved campaigns.';
@@ -72,7 +72,7 @@ window.edpInitEditor = async function(container, signal) {
         const frame=find('#email-preview');
         frame.setAttribute('sandbox','');
         frame.setAttribute('referrerpolicy','no-referrer');
-        frame.srcdoc='<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light"><style>html,body{background:#fff;color:#222}body{margin:0;padding:20px;font-family:Arial,sans-serif}img{max-width:100%;height:auto}table{max-width:100%}</style></head><body>'+out.html+'</body></html>';
+        frame.srcdoc=out.document || '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light"><style>html,body{background:#fff;color:#222}body{margin:0;padding:20px;font-family:Arial,sans-serif}img{max-width:100%;height:auto}table{max-width:100%}</style></head><body>'+out.html+'</body></html>';
         if (find('#preview-plain')) find('#preview-plain').textContent=out.plain;
         previewStatus.textContent='Preview of your current changes with sample variables. Nothing was saved or sent.';
       } catch(error) {

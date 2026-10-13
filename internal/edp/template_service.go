@@ -149,7 +149,12 @@ func (a *App) previewTemplate(w http.ResponseWriter, r *http.Request) {
 		problem(w, 400, e.Error())
 		return
 	}
-	respond(w, 200, map[string]any{"subject": rendered.Subject, "html": rendered.HTML, "plain": rendered.Plain})
+	config, e := a.runtimeConfig(r.Context())
+	if e != nil {
+		problem(w, 503, "preview configuration unavailable")
+		return
+	}
+	respond(w, 200, map[string]any{"subject": rendered.Subject, "html": rendered.HTML, "plain": rendered.Plain, "document": emailDocument(rendered.HTML, config.PublicURL)})
 }
 
 func (a *App) uploadEmailAsset(w http.ResponseWriter, r *http.Request) {

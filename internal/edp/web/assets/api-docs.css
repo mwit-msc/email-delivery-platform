@@ -1,0 +1,6 @@
+@font-face{font-family:Outfit;src:url('/assets/Outfit.ttf') format('truetype');font-weight:100 900;font-display:swap}
+body{margin:0;background:#111;color:#eee;font-family:Outfit,system-ui,sans-serif}
+.docs-bar{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:14px 22px;border-bottom:1px solid #353535}
+.docs-bar a{color:#b8afff;text-decoration:none;font-size:14px}.docs-bar a:hover{text-decoration:underline}
+.docs-bar nav{display:flex;flex-wrap:wrap;gap:20px}#api-reference>p{padding:20px}
+@media(max-width:600px){.docs-bar{align-items:flex-start;flex-direction:column;padding:14px 16px}.docs-bar nav{gap:14px}}

@@ -53,7 +53,7 @@ func (a *App) apiTemplates(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == "GET" {
-		rows, e := a.query(r.Context(), "SELECT t.*,v.subject,v.variables FROM templates t JOIN template_versions v ON v.template_id=t.id AND v.version=t.current_version WHERE t.application_id=$1 ORDER BY t.name", app)
+		rows, e := a.query(r.Context(), "SELECT t.*,v.subject,v.variables FROM templates t JOIN template_versions v ON v.template_id=t.id AND v.version=t.current_version WHERE t.application_id=$1 AND ($2 OR NOT t.archived) ORDER BY t.name", app, r.URL.Query().Get("include_archived") == "true")
 		if e != nil {
 			problem(w, 500, "templates unavailable")
 			return

@@ -136,8 +136,9 @@ func (a *App) templates(w http.ResponseWriter, r *http.Request) {
 	if !a.require(w, r, scope, "template.view") {
 		return
 	}
-	rows, _ := a.query(r.Context(), "SELECT t.*,v.subject,v.variables FROM templates t JOIN template_versions v ON v.template_id=t.id AND v.version=t.current_version WHERE t.application_id=$1 ORDER BY t.name", scope)
-	a.render(w, r, "templates", map[string]any{"Rows": rows, "Scope": scope})
+	includeArchived := r.URL.Query().Get("include_archived") == "true"
+	rows, _ := a.query(r.Context(), "SELECT t.*,v.subject,v.variables FROM templates t JOIN template_versions v ON v.template_id=t.id AND v.version=t.current_version WHERE t.application_id=$1 AND ($2 OR NOT t.archived) ORDER BY t.name", scope, includeArchived)
+	a.render(w, r, "templates", map[string]any{"Rows": rows, "Scope": scope, "IncludeArchived": includeArchived})
 }
 func regexpSlug(s string) bool {
 	if len(s) < 1 || len(s) > 100 {
