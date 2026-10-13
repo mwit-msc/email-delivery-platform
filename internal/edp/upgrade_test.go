@@ -135,19 +135,25 @@ func TestReleasedV1UpgradePreservesDataAndDelivery(t *testing.T) {
 	}
 	var savedHash, runtimeAfter string
 	a.DB.QueryRow(ctx, "SELECT password_hash FROM users WHERE id=$1", root).Scan(&savedHash)
-	a.DB.QueryRow(ctx, "SELECT runtime_config::text FROM platform_settings WHERE id=1").Scan(&runtimeAfter)
-	if savedHash != rootHash || runtimeBefore != runtimeAfter || !checkPassword(savedHash, "synthetic-upgrade-root-password") {
+	a.DB.QueryRow(ctx, "SELECT legacy_relay_backup::text FROM platform_settings WHERE id=1").Scan(&runtimeAfter)
+	if savedHash != rootHash || !checkPassword(savedHash, "synthetic-upgrade-root-password") {
 		t.Fatal("migration or repeat seeding changed the root password or saved settings")
 	}
-	loaded, err := a.runtimeConfig(ctx)
+	var before, after RuntimeSettings
+	json.Unmarshal([]byte(runtimeBefore), &before)
+	json.Unmarshal([]byte(runtimeAfter), &after)
+	if before.SMTP == nil || after.SMTP == nil || *before.SMTP != *after.SMTP {
+		t.Fatal("encrypted SMTP settings were not copied exactly")
+	}
+	loaded, err := a.relayConfig(ctx, importedPrimaryRelay, "notifications@example.test", a.C)
 	if err != nil || loaded.SMTPAddress != config.SMTPAddress || loaded.SMTPPassword != config.SMTPPassword || loaded.SMTPUser != config.SMTPUser || loaded.BounceDomain != config.BounceDomain {
 		t.Fatal("saved encrypted SMTP configuration did not survive the upgrade")
 	}
 	var strict bool
-	if err := a.DB.QueryRow(ctx, "SELECT strict_sender_domains FROM platform_settings WHERE id=1").Scan(&strict); err != nil || strict {
-		t.Fatal("upgrade unexpectedly enabled strict sender routing", err)
+	if err := a.DB.QueryRow(ctx, "SELECT strict_sender_domains FROM platform_settings WHERE id=1").Scan(&strict); err != nil || !strict {
+		t.Fatal("upgrade did not require named sender routing", err)
 	}
-	if route, err := a.senderRelay(ctx, "notifications@example.test"); err != nil || route != "" {
+	if route, err := a.senderRelay(ctx, "notifications@example.test"); err != nil || route != importedPrimaryRelay {
 		t.Fatal("legacy sender no longer resolves to its saved default SMTP configuration", route, err)
 	}
 	var route, envelope, state, hash, subject string
@@ -155,7 +161,7 @@ func TestReleasedV1UpgradePreservesDataAndDelivery(t *testing.T) {
 	if err := a.DB.QueryRow(ctx, "SELECT route,relay_id,fallback_relay_id,envelope_sender,status,payload_hash,subject FROM messages WHERE id='msg_released'").Scan(&route, &namedRelay, &fallbackRelay, &envelope, &state, &hash, &subject); err != nil {
 		t.Fatal(err)
 	}
-	if route != "primary" || namedRelay != nil || fallbackRelay != nil || envelope != "bounce-released@bounce.example.test" || state != "queued" || hash != tokenHash(string(payload)) || subject != "Released version Synthetic" {
+	if route != "primary" || (namedRelay == nil || *namedRelay != importedPrimaryRelay) || fallbackRelay != nil || envelope != "bounce-released@bounce.example.test" || state != "queued" || hash != tokenHash(string(payload)) || subject != "Released version Synthetic" {
 		t.Fatal("upgrade changed a pending message, envelope, route, or idempotency payload")
 	}
 	var version, rowVersion, events int
@@ -170,6 +176,13 @@ func TestReleasedV1UpgradePreservesDataAndDelivery(t *testing.T) {
 	var sourceOrdinals []int
 	if err := a.DB.QueryRow(ctx, "SELECT ordinal,source_ordinals FROM campaign_rows WHERE campaign_id='cmp_released'").Scan(&ordinal, &sourceOrdinals); err != nil || len(sourceOrdinals) != 1 || sourceOrdinals[0] != ordinal {
 		t.Fatal("upgrade lost the released campaign's source row", err, sourceOrdinals)
+	}
+	var messageCC, campaignCC []string
+	if err := a.DB.QueryRow(ctx, "SELECT cc FROM messages WHERE id='msg_released'").Scan(&messageCC); err != nil || len(messageCC) != 0 {
+		t.Fatal("upgrade added unexpected message copies", err)
+	}
+	if err := a.DB.QueryRow(ctx, "SELECT cc FROM campaigns WHERE id='cmp_released'").Scan(&campaignCC); err != nil || len(campaignCC) != 0 {
+		t.Fatal("upgrade added unexpected campaign copies", err)
 	}
 	var owner *string
 	if err := a.DB.QueryRow(ctx, "SELECT created_by FROM api_keys WHERE id='key_released'").Scan(&owner); err != nil || owner != nil {

@@ -78,7 +78,9 @@ func (a *App) queueFallback(ctx context.Context, tx pgx.Tx, id string) error {
 		}
 	}
 
-	tag, e := tx.Exec(ctx, `UPDATE messages m SET route='secondary',fallback_relay_id=NULLIF($2,''),secondary_used=true,status='queued',route_attempts=0,available_at=now(),lease_until=NULL,lease_token=NULL,relay_accepted_at=NULL,updated_at=now() FROM applications a WHERE m.id=$1 AND m.application_id=a.id AND a.fallback_enabled AND m.route='primary' AND NOT m.secondary_used AND m.failure_category='ip_reputation' AND m.status IN('failed','bounced') AND m.expires_at>now()`, id, fallback)
+	// A remote rejection of To cannot prove the CC copies were also rejected.
+	// Fallback before relay acceptance remains safe: no recipient received DATA.
+	tag, e := tx.Exec(ctx, `UPDATE messages m SET route='secondary',fallback_relay_id=NULLIF($2,''),secondary_used=true,status='queued',route_attempts=0,available_at=now(),lease_until=NULL,lease_token=NULL,relay_accepted_at=NULL,updated_at=now() FROM applications a WHERE m.id=$1 AND m.application_id=a.id AND a.fallback_enabled AND m.route='primary' AND NOT m.secondary_used AND m.failure_category='ip_reputation' AND m.status IN('failed','bounced') AND m.expires_at>now() AND (cardinality(m.cc)=0 OR m.relay_accepted_at IS NULL)`, id, fallback)
 	if e != nil {
 		return e
 	}

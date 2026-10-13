@@ -12,6 +12,7 @@ import (
 	"mime"
 	"mime/multipart"
 	"net"
+	"net/mail"
 	"net/smtp"
 	"net/textproto"
 	"strings"
@@ -19,8 +20,9 @@ import (
 )
 
 type delivery struct {
-	ID, AppID, Recipient, From, Reply, Subject, HTML, Plain, Lease, Route, RelayID, FallbackRelayID string
-	Attempts                                                                                        int
+	ID, AppID, Recipient, From, FromName, Reply, Subject, HTML, Plain, Lease, Route, RelayID, FallbackRelayID string
+	Attempts                                                                                                  int
+	CC                                                                                                        []string
 }
 
 func (a *App) claim(ctx context.Context) (*delivery, error) {
@@ -49,7 +51,7 @@ func (a *App) claim(ctx context.Context) (*delivery, error) {
 		return nil, nil
 	}
 	d := &delivery{}
-	e = tx.QueryRow(ctx, `SELECT m.id,m.application_id,m.recipient,m.from_address,m.reply_to,m.subject,m.html,m.plain,m.route_attempts,m.route,coalesce(m.relay_id,''),coalesce(m.fallback_relay_id,'') FROM messages m JOIN applications a ON a.id=m.application_id LEFT JOIN campaigns c ON c.id=m.campaign_id WHERE m.status IN('queued','retry_wait') AND m.available_at<=now() AND m.expires_at>now() AND NOT a.paused AND a.next_send_at<=now() AND (m.campaign_id IS NULL OR c.state='sending') ORDER BY CASE WHEN $1::bigint%5=4 AND m.class='bulk' THEN -1 ELSE CASE m.class WHEN 'otp' THEN 0 WHEN 'transactional' THEN 1 ELSE 2 END END,a.next_send_at,m.available_at,m.created_at FOR UPDATE OF m SKIP LOCKED LIMIT 1`, dispatchCounter).Scan(&d.ID, &d.AppID, &d.Recipient, &d.From, &d.Reply, &d.Subject, &d.HTML, &d.Plain, &d.Attempts, &d.Route, &d.RelayID, &d.FallbackRelayID)
+	e = tx.QueryRow(ctx, `SELECT m.id,m.application_id,m.recipient,m.from_address,m.from_name,m.reply_to,m.subject,m.html,m.plain,m.route_attempts,m.route,coalesce(m.relay_id,''),coalesce(m.fallback_relay_id,'') ,m.cc FROM messages m JOIN applications a ON a.id=m.application_id LEFT JOIN campaigns c ON c.id=m.campaign_id WHERE m.status IN('queued','retry_wait') AND m.available_at<=now() AND m.expires_at>now() AND NOT a.paused AND a.next_send_at<=now() AND (m.campaign_id IS NULL OR c.state='sending') ORDER BY CASE WHEN $1::bigint%5=4 AND m.class='bulk' THEN -1 ELSE CASE m.class WHEN 'otp' THEN 0 WHEN 'transactional' THEN 1 ELSE 2 END END,a.next_send_at,m.available_at,m.created_at FOR UPDATE OF m SKIP LOCKED LIMIT 1`, dispatchCounter).Scan(&d.ID, &d.AppID, &d.Recipient, &d.From, &d.FromName, &d.Reply, &d.Subject, &d.HTML, &d.Plain, &d.Attempts, &d.Route, &d.RelayID, &d.FallbackRelayID, &d.CC)
 	if e == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -185,9 +187,19 @@ func makeMIME(d delivery, publicURL string) []byte {
 	if u := strings.TrimPrefix(strings.TrimPrefix(publicURL, "https://"), "http://"); u != "" {
 		domain = strings.Split(strings.Split(u, "/")[0], ":")[0]
 	}
-	fmt.Fprintf(&b, "From: %s\r\nTo: %s\r\nSubject: %s\r\nDate: %s\r\nMessage-ID: <%s@%s>\r\nX-EDP-Message-ID: %s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=%q\r\n", d.From, d.Recipient, mime.QEncoding.Encode("utf-8", d.Subject), time.Now().Format(time.RFC1123Z), d.ID, domain, d.ID, mw.Boundary())
+	from := d.From
+	if validDisplayName(d.FromName) && d.FromName != "" {
+		from = (&mail.Address{Name: d.FromName, Address: d.From}).String()
+		if strings.HasPrefix(from, "=?") {
+			from = strings.ReplaceAll(from, "?= =?", "?=\r\n =?")
+		}
+	}
+	fmt.Fprintf(&b, "From: %s\r\nTo: %s\r\nSubject: %s\r\nDate: %s\r\nMessage-ID: <%s@%s>\r\nX-EDP-Message-ID: %s\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=%q\r\n", from, d.Recipient, mime.QEncoding.Encode("utf-8", d.Subject), time.Now().Format(time.RFC1123Z), d.ID, domain, d.ID, mw.Boundary())
 	if d.Reply != "" {
 		fmt.Fprintf(&b, "Reply-To: %s\r\n", d.Reply)
+	}
+	if len(d.CC) > 0 {
+		fmt.Fprintf(&b, "Cc: %s\r\n", strings.Join(d.CC, ",\r\n "))
 	}
 	b.WriteString("\r\n")
 	for _, part := range []struct{ Type, Body string }{{"text/plain", d.Plain}, {"text/html", emailDocument(d.HTML, publicURL)}} {
@@ -216,6 +228,11 @@ func smtpFailure(e error, uncertain bool) (string, string) {
 	return "retry_wait", "SMTP connection or temporary rejection; retry scheduled"
 }
 func (a *App) smtpSend(ctx context.Context, d delivery) (string, string) {
+	cc, err := normalizeCC(d.Recipient, d.CC)
+	if err != nil {
+		return "failed", err.Error()
+	}
+	d.CC = cc
 	config, configErr := a.runtimeConfig(ctx)
 	if configErr != nil {
 		return "retry_wait", "Runtime configuration is unavailable"
@@ -312,6 +329,12 @@ func (a *App) smtpSend(ctx context.Context, d delivery) (string, string) {
 	}
 	if e = client.Rcpt(d.Recipient); e != nil {
 		return smtpFailure(e, false)
+	}
+	for _, address := range d.CC {
+		if e = client.Rcpt(address); e != nil {
+			// DATA is never submitted unless all recipients were accepted.
+			return smtpFailure(e, false)
+		}
 	}
 	writer, e := client.Data()
 	if e != nil {

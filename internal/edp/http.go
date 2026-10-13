@@ -10,6 +10,7 @@ import (
 	"html/template"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -232,6 +233,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/campaigns/{id}", a.apiCampaign)
 	mux.HandleFunc("POST /v1/campaigns/{id}/import", a.apiCampaignImport)
 	mux.HandleFunc("POST /v1/campaigns/{id}/mapping", a.apiCampaignMapping)
+	mux.HandleFunc("POST /v1/campaigns/{id}/cc", a.apiCampaignCC)
 	mux.HandleFunc("GET /v1/campaigns/{id}/progress", a.apiCampaignProgress)
 	mux.HandleFunc("GET /v1/campaigns/{id}/export", a.campaignExport)
 	mux.HandleFunc("POST /v1/campaigns/{id}/{action}", a.apiCampaignAction)
@@ -334,8 +336,11 @@ func (a *App) application(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var secret string
+	var branding []BrandingCheck
 	if r.Method == "POST" {
 		switch r.FormValue("action") {
+		case "branding-check":
+			branding = checkInboxBranding(r.Context(), fmt.Sprint(data["from_address"]), net.DefaultResolver.LookupTXT)
 		case "webhook":
 			if !a.require(w, r, id, "webhook.manage") {
 				return
@@ -377,6 +382,11 @@ func (a *App) application(w http.ResponseWriter, r *http.Request) {
 			_, e = a.DB.Exec(r.Context(), "UPDATE api_keys SET revoked=true WHERE id=$1 AND application_id=$2", r.FormValue("key"), id)
 		default:
 			from, reply := strings.TrimSpace(r.FormValue("from")), strings.TrimSpace(r.FormValue("reply"))
+			fromName := strings.TrimSpace(r.FormValue("from_name"))
+			if !validDisplayName(fromName) {
+				problem(w, 400, "sender display name must be at most 120 characters without control characters")
+				return
+			}
 			if !validAddress(from) || reply != "" && !validAddress(reply) {
 				problem(w, 400, "invalid sender or reply address")
 				return
@@ -398,7 +408,7 @@ func (a *App) application(w http.ResponseWriter, r *http.Request) {
 			if a.Allowed(r.Context(), person(r), "*", "platform.manage") {
 				fallback = r.FormValue("fallback_enabled") == "on"
 			}
-			_, e = a.DB.Exec(r.Context(), "UPDATE applications SET name=$2,from_address=$3,reply_to=$4,daily_limit=$5,rate_per_minute=$6,recipient_hour_limit=$7,queue_limit=$8,paused=$9,fallback_enabled=$10 WHERE id=$1", id, r.FormValue("name"), from, reply, daily, rate, recipient, queue, r.FormValue("paused") == "on", fallback)
+			_, e = a.DB.Exec(r.Context(), "UPDATE applications SET name=$2,from_address=$3,reply_to=$4,daily_limit=$5,rate_per_minute=$6,recipient_hour_limit=$7,queue_limit=$8,paused=$9,fallback_enabled=$10,from_name=$11 WHERE id=$1", id, r.FormValue("name"), from, reply, daily, rate, recipient, queue, r.FormValue("paused") == "on", fallback, fromName)
 		}
 		if e != nil {
 			problem(w, 400, "could not update application")
@@ -416,7 +426,7 @@ func (a *App) application(w http.ResponseWriter, r *http.Request) {
 		problem(w, 500, "runtime configuration unavailable")
 		return
 	}
-	a.render(w, r, "application", map[string]any{"Application": data, "Keys": keys, "Secret": secret, "Scope": id, "SecondaryConfigured": config.SecondarySMTPAddress != "" || a.hasNamedFallback(r.Context()), "KeyScopeOptions": a.grantableScopes(r), "Webhooks": a.webhookView(r.Context(), id)})
+	a.render(w, r, "application", map[string]any{"Application": data, "Branding": branding, "Keys": keys, "Secret": secret, "Scope": id, "SecondaryConfigured": config.SecondarySMTPAddress != "" || a.hasNamedFallback(r.Context()), "KeyScopeOptions": a.grantableScopes(r), "Webhooks": a.webhookView(r.Context(), id)})
 }
 func (a *App) apiSubmit(w http.ResponseWriter, r *http.Request) {
 	p := person(r)

@@ -127,6 +127,17 @@ func (a *App) settings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		action := r.FormValue("action")
+		if strings.HasPrefix(action, "smtp.") || strings.HasPrefix(action, "secondary.") {
+			var namedOnly bool
+			if e = a.DB.QueryRow(r.Context(), "SELECT named_relays_only FROM platform_settings WHERE id=1").Scan(&namedOnly); e != nil {
+				problem(w, 503, "relay configuration unavailable")
+				return
+			}
+			if namedOnly {
+				problem(w, 400, "primary and secondary settings are retired; use named SMTP relays")
+				return
+			}
+		}
 		if action == "" || action == "limits" {
 			rate, connections := positiveInt(r.FormValue("rate")), positiveInt(r.FormValue("connections"))
 			if rate < 1 || connections < 1 || connections > 100 {

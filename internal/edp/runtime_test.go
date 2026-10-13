@@ -163,15 +163,16 @@ func TestRuntimeSettingsSecretsAndPermissions(t *testing.T) {
 }
 
 type runtimeSMTPFixture struct {
-	Address string
-	Data    atomic.Int64
-	Noop    atomic.Int64
-	Auth    atomic.Int64
-	mu      sync.Mutex
-	Bodies  []string
+	Address    string
+	Data       atomic.Int64
+	Noop       atomic.Int64
+	Auth       atomic.Int64
+	mu         sync.Mutex
+	Bodies     []string
+	Recipients []string
 }
 
-func newRuntimeSMTPFixture(t *testing.T, rejectRCPT, username, password string) *runtimeSMTPFixture {
+func newRuntimeSMTPFixture(t *testing.T, rejectRCPT, username, password string, rejectAddress ...string) *runtimeSMTPFixture {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -222,7 +223,11 @@ func newRuntimeSMTPFixture(t *testing.T, rejectRCPT, username, password string) 
 						fixture.Noop.Add(1)
 						fmt.Fprint(conn, "250 OK\r\n")
 					case "RCPT":
-						if rejectRCPT != "" {
+						address := strings.TrimSuffix(strings.TrimPrefix(line, "RCPT TO:<"), ">")
+						fixture.mu.Lock()
+						fixture.Recipients = append(fixture.Recipients, address)
+						fixture.mu.Unlock()
+						if rejectRCPT != "" && (len(rejectAddress) == 0 || address == rejectAddress[0]) {
 							fmt.Fprintf(conn, "%s\r\n", rejectRCPT)
 						} else {
 							fmt.Fprint(conn, "250 Recipient accepted\r\n")

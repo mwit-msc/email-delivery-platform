@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Email Delivery Platform
-  version: 1.2.1
+  version: 1.3.0
   description: Application-scoped bearer API for durable delivery, templates, campaigns, assets, and webhooks.
     relay.manage is a privileged platform-wide permission. Expanded API operations reject unknown JSON
     fields and multiple JSON values.
@@ -23,6 +23,8 @@ components:
         to:
           type: string
           format: email
+        cc:
+          $ref: '#/components/schemas/CCRecipients'
         template:
           type: string
         template_version:
@@ -47,6 +49,22 @@ components:
         application_id:
           type: string
           description: Optional; must match the bearer key application. Omit to use key scope.
+      additionalProperties: false
+    CCRecipients:
+      type: array
+      maxItems: 20
+      items:
+        type: string
+        format: email
+      description: Bare CC mailbox addresses. Whitespace and domain casing are normalized;
+        duplicates and the To recipient are removed. Copies consume daily recipient quota
+        and recipient cooldown limits. BCC is not supported.
+    CampaignCC:
+      type: object
+      properties:
+        cc:
+          $ref: '#/components/schemas/CCRecipients'
+      required: [cc]
       additionalProperties: false
     Error:
       type: object
@@ -265,6 +283,8 @@ components:
           - certificate
           - bulk
           default: certificate
+        cc:
+          $ref: '#/components/schemas/CCRecipients'
       additionalProperties: false
       required:
       - name
@@ -366,7 +386,7 @@ components:
       properties:
         strict:
           type: boolean
-          description: Toggle strict routing; default platform setting is false. Cannot combine with domain.
+          description: Deprecated mode control. v1.3.0 always requires named routes; false is rejected. Cannot combine with domain.
         domain:
           type: string
           description: Exact sender From-address domain, normalized to lowercase ASCII/punycode.
@@ -375,7 +395,7 @@ components:
           description: Relay allowing this domain; empty removes this domain route.
       additionalProperties: false
       description: Supply either strict, or domain and relay_id. Strict mode rejects unmapped sender domains.
-        Non-strict unmapped domains retain legacy primary SMTP behavior.
+        v1.3.0 rejects disabling strict routing; all sender domains require named routes.
     WebhookInput:
       type: object
       properties:
@@ -1095,6 +1115,43 @@ paths:
               oneOf:
               - $ref: '#/components/schemas/Mapping'
               - $ref: '#/components/schemas/BulkMapping'
+  /v1/campaigns/{id}/cc:
+    parameters:
+    - name: id
+      in: path
+      required: true
+      schema:
+        type: string
+    post:
+      operationId: setCampaignCC
+      summary: Set or clear the CC list on a draft campaign
+      description: Requires campaign.edit. Approval freezes copies. An approved but unsent
+        campaign must return to draft before editing and be approved again. Saving CC does
+        not queue mail. Test sends intentionally omit campaign CC and go only to the test address.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CampaignCC'
+      responses:
+        '200':
+          description: Saved; no message queued.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  saved:
+                    type: boolean
+        '400':
+          description: Invalid addresses, missing array, or campaign is not draft.
+        '401':
+          description: Invalid or missing authentication.
+        '403':
+          description: Insufficient permission.
+        '404':
+          description: Campaign absent in this application.
   /v1/campaigns/{id}/{action}:
     parameters:
     - in: path

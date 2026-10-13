@@ -119,7 +119,7 @@ func (a *App) apiCampaigns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == "GET" {
-		rows, e := a.query(r.Context(), "SELECT id,name,kind,state,approved_at,scheduled_at,created_at FROM campaigns WHERE application_id=$1 ORDER BY created_at DESC LIMIT 1000", app)
+		rows, e := a.query(r.Context(), "SELECT id,name,kind,state,approved_at,scheduled_at,created_at,cc FROM campaigns WHERE application_id=$1 ORDER BY created_at DESC LIMIT 1000", app)
 		if e != nil {
 			problem(w, 500, "campaigns unavailable")
 			return
@@ -128,8 +128,9 @@ func (a *App) apiCampaigns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		Name string `json:"name"`
-		Kind string `json:"kind"`
+		Name string   `json:"name"`
+		Kind string   `json:"kind"`
+		CC   []string `json:"cc"`
 	}
 	if !decodeAPI(w, r, &in) {
 		return
@@ -141,13 +142,18 @@ func (a *App) apiCampaigns(w http.ResponseWriter, r *http.Request) {
 		problem(w, 400, "name and certificate or bulk kind required")
 		return
 	}
+	cc, err := normalizeCC("", in.CC)
+	if err != nil {
+		problem(w, 400, err.Error())
+		return
+	}
 	actor, e := a.keyActor(r.Context(), person(r))
 	if e != nil {
 		problem(w, 400, "create a new service key before using campaign automation")
 		return
 	}
 	id := newID("cmp_")
-	_, e = a.DB.Exec(r.Context(), "INSERT INTO campaigns(id,application_id,name,kind,created_by) VALUES($1,$2,$3,$4,$5)", id, app, in.Name, in.Kind, actor)
+	_, e = a.DB.Exec(r.Context(), "INSERT INTO campaigns(id,application_id,name,kind,created_by,cc) VALUES($1,$2,$3,$4,$5,$6)", id, app, in.Name, in.Kind, actor, cc)
 	if e != nil {
 		problem(w, 500, "campaign could not be created")
 		return

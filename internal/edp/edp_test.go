@@ -72,6 +72,11 @@ func testApp(t *testing.T) *App {
 	if e = app.Seed(ctx, true); e != nil {
 		t.Fatal(e)
 	}
+	// Released-version regression fixtures retain the legacy compatibility branch.
+	// Named-only upgrade tests explicitly restore the migration default.
+	if _, e = app.DB.Exec(ctx, "UPDATE platform_settings SET named_relays_only=false,strict_sender_domains=false; DELETE FROM sender_domain_routes; DELETE FROM smtp_relays"); e != nil {
+		t.Fatal(e)
+	}
 	return app
 }
 func TestPlatformIntegration(t *testing.T) {

@@ -33,7 +33,7 @@ func (a *App) relaySettingsAction(w http.ResponseWriter, r *http.Request) bool {
 	case "domain.save":
 		e = a.setDomainRoute(r.Context(), r.FormValue("domain"), r.FormValue("relay_id"))
 	case "routing.save":
-		_, e = a.DB.Exec(r.Context(), "UPDATE platform_settings SET strict_sender_domains=$1 WHERE id=1", r.FormValue("strict") == "on")
+		e = a.setStrictRouting(r.Context(), r.FormValue("strict") == "on")
 	default:
 		e = fmt.Errorf("unknown relay action")
 	}
@@ -56,8 +56,8 @@ func (a *App) apiRelays(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		routes, _ := a.query(r.Context(), "SELECT domain,relay_id FROM sender_domain_routes ORDER BY domain")
-		settings, _ := a.one(r.Context(), "SELECT strict_sender_domains FROM platform_settings WHERE id=1")
-		respond(w, 200, map[string]any{"relays": rows, "routes": routes, "strict": settings["strict_sender_domains"]})
+		settings, _ := a.one(r.Context(), "SELECT strict_sender_domains OR named_relays_only AS strict FROM platform_settings WHERE id=1")
+		respond(w, 200, map[string]any{"relays": rows, "routes": routes, "strict": settings["strict"]})
 		return
 	}
 	if op := r.PathValue("operation"); op != "" && op != "test" {
@@ -107,7 +107,7 @@ func (a *App) apiRouting(w http.ResponseWriter, r *http.Request) {
 	}
 	var e error
 	if in.Strict != nil {
-		_, e = a.DB.Exec(r.Context(), "UPDATE platform_settings SET strict_sender_domains=$1 WHERE id=1", *in.Strict)
+		e = a.setStrictRouting(r.Context(), *in.Strict)
 	} else {
 		e = a.setDomainRoute(r.Context(), in.Domain, in.RelayID)
 	}
@@ -117,4 +117,16 @@ func (a *App) apiRouting(w http.ResponseWriter, r *http.Request) {
 	}
 	a.audit(r.Context(), person(r).ID, "relay.routing", "*", "")
 	respond(w, 200, map[string]any{"success": true})
+}
+
+func (a *App) setStrictRouting(ctx context.Context, strict bool) error {
+	var namedOnly bool
+	if err := a.DB.QueryRow(ctx, "SELECT named_relays_only FROM platform_settings WHERE id=1").Scan(&namedOnly); err != nil {
+		return err
+	}
+	if namedOnly && !strict {
+		return fmt.Errorf("named SMTP relays require explicit sender-domain routes")
+	}
+	_, err := a.DB.Exec(ctx, "UPDATE platform_settings SET strict_sender_domains=$1 WHERE id=1", strict)
+	return err
 }

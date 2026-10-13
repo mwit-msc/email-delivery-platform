@@ -231,15 +231,15 @@ func senderRelayWith(ctx context.Context, q rowQuerier, from string) (string, er
 		return "", e
 	}
 	var id string
-	var strict bool
+	var strict, namedOnly bool
 	var domains []string
 	var enabled bool
-	e = q.QueryRow(ctx, `SELECT p.strict_sender_domains,COALESCE(r.id,''),COALESCE(r.allowed_domains,'{}'::text[]),COALESCE(r.enabled,false) FROM platform_settings p LEFT JOIN sender_domain_routes d ON d.domain=$1 LEFT JOIN smtp_relays r ON r.id=d.relay_id WHERE p.id=1`, domain).Scan(&strict, &id, &domains, &enabled)
+	e = q.QueryRow(ctx, `SELECT p.strict_sender_domains,p.named_relays_only,COALESCE(r.id,''),COALESCE(r.allowed_domains,'{}'::text[]),COALESCE(r.enabled,false) FROM platform_settings p LEFT JOIN sender_domain_routes d ON d.domain=$1 LEFT JOIN smtp_relays r ON r.id=d.relay_id WHERE p.id=1`, domain).Scan(&strict, &namedOnly, &id, &domains, &enabled)
 	if e != nil {
 		return "", e
 	}
 	if id == "" {
-		if strict {
+		if strict || namedOnly {
 			return "", fmt.Errorf("sender domain has no configured relay route")
 		}
 		return "", nil

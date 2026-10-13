@@ -71,7 +71,7 @@ func LoadConfig() (Config, error) {
 		RootUsername:          env("ROOT_USERNAME", "root"),
 		RootPassword:          os.Getenv("ROOT_PASSWORD"),
 		RootHash:              os.Getenv("ROOT_PASSWORD_HASH"),
-		SMTPAddress:           env("SMTP_ADDR", "mailpit:1025"),
+		SMTPAddress:           os.Getenv("SMTP_ADDR"),
 		SMTPUser:              os.Getenv("SMTP_USERNAME"),
 		SMTPPassword:          os.Getenv("SMTP_PASSWORD"),
 		SMTPTLS:               env("SMTP_TLS", "starttls"),
@@ -94,6 +94,9 @@ func LoadConfig() (Config, error) {
 		RetentionDays:         30}
 	if n, err := strconv.Atoi(env("RETENTION_DAYS", "30")); err == nil && n > 0 {
 		c.RetentionDays = n
+	}
+	if c.Dev && c.SMTPAddress == "" {
+		c.SMTPAddress = "mailpit:1025"
 	}
 	if c.DatabaseURL == "" {
 		return c, errors.New("DATABASE_URL is required")

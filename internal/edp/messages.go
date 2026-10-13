@@ -93,6 +93,7 @@ func renderVariables(s string, vars map[string]string, escape bool) (string, err
 type SendInput struct {
 	ApplicationID string            `json:"application_id"`
 	To            string            `json:"to"`
+	CC            []string          `json:"cc,omitempty"`
 	Template      string            `json:"template"`
 	Version       int               `json:"template_version"`
 	Variables     map[string]string `json:"variables"`
@@ -159,6 +160,11 @@ func (a *App) Submit(ctx context.Context, in SendInput, key string) (string, boo
 	if !validAddress(in.To) {
 		return "", false, &HTTPError{400, "invalid recipient address"}
 	}
+	cc, err := normalizeCC(in.To, in.CC)
+	if err != nil {
+		return "", false, &HTTPError{400, err.Error()}
+	}
+	in.CC = cc
 	if in.Class == "" {
 		in.Class = "transactional"
 	}
@@ -173,9 +179,9 @@ func (a *App) Submit(ctx context.Context, in SendInput, key string) (string, boo
 	}
 	defer tx.Rollback(ctx)
 	var paused bool
-	var from, reply string
+	var from, reply, fromName string
 	var daily, recipientLimit, queueLimit int
-	e = tx.QueryRow(ctx, "SELECT paused,from_address,reply_to,daily_limit,recipient_hour_limit,queue_limit FROM applications WHERE id=$1 FOR UPDATE", in.ApplicationID).Scan(&paused, &from, &reply, &daily, &recipientLimit, &queueLimit)
+	e = tx.QueryRow(ctx, "SELECT paused,from_address,reply_to,from_name,daily_limit,recipient_hour_limit,queue_limit FROM applications WHERE id=$1 FOR UPDATE", in.ApplicationID).Scan(&paused, &from, &reply, &fromName, &daily, &recipientLimit, &queueLimit)
 	if e != nil {
 		return "", false, &HTTPError{404, "application not found"}
 	}
@@ -200,13 +206,20 @@ func (a *App) Submit(ctx context.Context, in SendInput, key string) (string, boo
 	if globallyPaused {
 		return "", false, &HTTPError{503, "sending is paused by the platform"}
 	}
-	var dayCount, recipientCount, queued int
-	e = tx.QueryRow(ctx, `SELECT count(*) FILTER(WHERE created_at>=now()-interval '24 hours'),count(*) FILTER(WHERE recipient=$2 AND created_at>=now()-interval '1 hour'),count(*) FILTER(WHERE status IN('queued','retry_wait','sending')) FROM messages WHERE application_id=$1`, in.ApplicationID, in.To).Scan(&dayCount, &recipientCount, &queued)
+	var dayCount, queued int
+	e = tx.QueryRow(ctx, `SELECT coalesce(sum(1+cardinality(cc)) FILTER(WHERE created_at>=now()-interval '24 hours'),0),count(*) FILTER(WHERE status IN('queued','retry_wait','sending')) FROM messages WHERE application_id=$1`, in.ApplicationID).Scan(&dayCount, &queued)
 	if e != nil {
 		return "", false, e
 	}
-	if dayCount >= daily || recipientCount >= recipientLimit || queued >= queueLimit {
+	if dayCount+1+len(cc) > daily || queued >= queueLimit {
 		return "", false, &HTTPError{429, "application quota, recipient cooldown, or queue capacity reached"}
+	}
+	additions := map[string]int{strings.ToLower(in.To): 1}
+	for _, address := range cc {
+		additions[strings.ToLower(address)]++
+	}
+	if err := checkRecipientCapacity(ctx, tx, in.ApplicationID, additions, recipientLimit); err != nil {
+		return "", false, &HTTPError{429, err.Error()}
 	}
 	expires := time.Now().Add(24 * time.Hour)
 	if in.Class == "otp" {
@@ -234,7 +247,7 @@ func (a *App) Submit(ctx context.Context, in SendInput, key string) (string, boo
 		return "", false, &HTTPError{400, relayError.Error()}
 	}
 	id := newID("msg_")
-	_, e = tx.Exec(ctx, `INSERT INTO messages(id,application_id,recipient,from_address,reply_to,subject,html,plain,class,idempotency_key,payload_hash,available_at,expires_at,relay_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NULLIF($14,''))`, id, in.ApplicationID, in.To, from, reply, rendered.Subject, rendered.HTML, rendered.Plain, in.Class, key, fingerprint, scheduled, expires, relayID)
+	_, e = tx.Exec(ctx, `INSERT INTO messages(id,application_id,recipient,from_address,reply_to,subject,html,plain,class,idempotency_key,payload_hash,available_at,expires_at,relay_id,cc,from_name) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NULLIF($14,''),$15,$16)`, id, in.ApplicationID, in.To, from, reply, rendered.Subject, rendered.HTML, rendered.Plain, in.Class, key, fingerprint, scheduled, expires, relayID, cc, fromName)
 	if e != nil {
 		return "", false, e
 	}

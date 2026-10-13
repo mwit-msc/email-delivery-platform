@@ -50,7 +50,8 @@ func (a *App) runtimeConfig(ctx context.Context) (Config, error) {
 func readRuntimeConfig(ctx context.Context, q rowQuerier, base Config) (Config, error) {
 	c := base
 	var data []byte
-	if e := q.QueryRow(ctx, "SELECT runtime_config FROM platform_settings WHERE id=1").Scan(&data); e != nil {
+	var namedOnly bool
+	if e := q.QueryRow(ctx, "SELECT runtime_config,named_relays_only FROM platform_settings WHERE id=1").Scan(&data, &namedOnly); e != nil {
 		return c, e
 	}
 	var s RuntimeSettings
@@ -61,7 +62,7 @@ func readRuntimeConfig(ctx context.Context, q rowQuerier, base Config) (Config, 
 	if s.PublicURL != "" {
 		c.PublicURL = s.PublicURL
 	}
-	if s.SMTP != nil {
+	if s.SMTP != nil && !namedOnly {
 		c.SMTPAddress = s.SMTP.Address
 		c.SMTPTLS = s.SMTP.TLS
 		c.SMTPUser = s.SMTP.Username
@@ -72,7 +73,7 @@ func readRuntimeConfig(ctx context.Context, q rowQuerier, base Config) (Config, 
 		}
 		c.BounceDomain = s.SMTP.BounceDomain
 	}
-	if s.Secondary != nil {
+	if s.Secondary != nil && !namedOnly {
 		c.SecondarySMTPAddress = s.Secondary.Address
 		c.SecondarySMTPTLS = s.Secondary.TLS
 		c.SecondarySMTPUser = s.Secondary.Username

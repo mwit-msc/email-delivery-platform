@@ -131,7 +131,24 @@ and an `Idempotency-Key` header. Accepted responses follow durable queue commit.
 Repeat the same key and identical payload to retrieve the same admission;
 changing its payload conflicts. Check `GET /v1/messages/{id}` with message.view.
 Cancellation requires message.cancel and is effective only before dispatch.
-Messages currently have one To recipient; CC/BCC is not supported.
+Messages have one To recipient and an optional `cc` array (up to 20 bare mailbox
+addresses). CC is persisted, included in the MIME Cc header and submitted as SMTP
+RCPT recipients. Duplicates and copies of To are removed. BCC is not supported.
+Daily recipient quota counts To plus CC; queue capacity counts message jobs.
+Recipient cooldowns include CC, including a shared copy mailbox on a campaign.
+
+Draft campaigns accept `cc` on creation or `POST /v1/campaigns/{id}/cc` with
+`{"cc":["copies@example.test"]}`; use `{"cc":[]}` to clear. Approval freezes the
+list. Return an approved, unsent campaign to draft before changing CC, then
+approve it again. Saving CC and approving never queue mail. Campaign tests
+intentionally omit CC and send only to the supplied test address.
+
+All SMTP RCPT commands must succeed before DATA is submitted. Remote delivery
+status/PMG evidence tracks the primary To recipient; CC delivery is not tracked
+separately. After the gateway accepts a message with CC, a remote To rejection
+cannot trigger whole-message fallback, since it could duplicate an accepted
+copy. Confirmed rejection before gateway acceptance can still use the existing
+opt-in, once-only fallback.
 
 `relay_accepted` means gateway acceptance. `remote_accepted` means acceptance by
 the recipient mail server. Neither proves inbox placement. An `unknown` result
@@ -158,3 +175,20 @@ contract rather than assuming a failed request was accepted.
 
 Do not place tokens in URLs, generated email HTML, webhook URLs, source control,
 or logs. Preparing a draft is separate from approving, starting, and sending.
+
+## Sender identity and inbox branding
+
+The sender address, display name and Reply-To are controlled per application in
+**Application settings**, with app.manage permission. Display names support Thai,
+are encoded in the MIME From header and do not change the SMTP envelope sender
+or relay routing. They are frozen when a message is admitted or a campaign is
+started. Message detail exposes `from_name`; API send payloads cannot override
+an authorized sender identity.
+
+Optional Inbox branding checks run in application settings. They inspect DNS
+only and do not validate a certificate or change DNS. A provider logo/checkmark
+is independent of the email-body logo and requires the provider's BIMI setup.
+
+Since v1.3.0, SMTP configuration uses named relays only. The upgrade converts
+legacy settings, preserves credentials/fallbacks and existing named routes, and
+requires an exact enabled sender-domain route. `strict:false` is rejected.

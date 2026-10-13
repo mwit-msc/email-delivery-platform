@@ -73,6 +73,11 @@ func (a *App) Migrate(ctx context.Context) error {
 			if _, e = tx.Exec(ctx, string(data)); e != nil {
 				return e
 			}
+			if version == 13 {
+				if e = a.migrateLegacyRelays(ctx, tx); e != nil {
+					return e
+				}
+			}
 		}
 	}
 	return tx.Commit(ctx)
@@ -114,6 +119,9 @@ func (a *App) Seed(ctx context.Context, demo bool) error {
 		name, sender := "Demo application", "notifications@example.test"
 
 		if _, e = tx.Exec(ctx, "INSERT INTO applications(id,name,from_address,daily_limit,recipient_hour_limit) VALUES('app_demo',$1,$2,5000,20) ON CONFLICT(id) DO NOTHING", name, sender); e != nil {
+			return e
+		}
+		if e = seedDemoRelay(ctx, tx); e != nil {
 			return e
 		}
 		var cases []struct{ Event, Award, Label, Subject, HTML, Text string }

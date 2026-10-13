@@ -453,38 +453,37 @@ func (a *App) startCampaign(ctx context.Context, id string, scheduled time.Time)
 	}
 	defer tx.Rollback(ctx)
 	var app, state string
-	e = tx.QueryRow(ctx, "SELECT application_id,state FROM campaigns WHERE id=$1 FOR UPDATE", id).Scan(&app, &state)
+	var campaignCC []string
+	e = tx.QueryRow(ctx, "SELECT application_id,state,cc FROM campaigns WHERE id=$1 FOR UPDATE", id).Scan(&app, &state, &campaignCC)
 	if e != nil {
 		return e
 	}
 	if state != "approved" {
 		return fmt.Errorf("approve campaign before scheduling")
 	}
-	var from, reply string
+	var from, reply, fromName string
 	var daily, queueLimit, recipientLimit int
 	var paused bool
-	e = tx.QueryRow(ctx, "SELECT from_address,reply_to,daily_limit,queue_limit,recipient_hour_limit,paused FROM applications WHERE id=$1 FOR UPDATE", app).Scan(&from, &reply, &daily, &queueLimit, &recipientLimit, &paused)
+	e = tx.QueryRow(ctx, "SELECT from_address,reply_to,from_name,daily_limit,queue_limit,recipient_hour_limit,paused FROM applications WHERE id=$1 FOR UPDATE", app).Scan(&from, &reply, &fromName, &daily, &queueLimit, &recipientLimit, &paused)
 	if e != nil {
 		return e
 	}
 	var platformPaused bool
-	tx.QueryRow(ctx, "SELECT paused FROM platform_settings WHERE id=1").Scan(&platformPaused)
+	if e = tx.QueryRow(ctx, "SELECT paused FROM platform_settings WHERE id=1").Scan(&platformPaused); e != nil {
+		return e
+	}
 	if paused || platformPaused {
 		return fmt.Errorf("sending is paused")
 	}
 	var count, used, queued int
-	tx.QueryRow(ctx, "SELECT count(*) FROM campaign_rows WHERE campaign_id=$1 AND NOT excluded", id).Scan(&count)
-	tx.QueryRow(ctx, "SELECT count(*) FILTER(WHERE created_at>=now()-interval '24 hours'),count(*) FILTER(WHERE status IN('queued','retry_wait','sending')) FROM messages WHERE application_id=$1", app).Scan(&used, &queued)
-	if count+used > daily*9/10 || count+queued > queueLimit*8/10 {
-		return fmt.Errorf("campaign exceeds application quota or queue capacity; transactional capacity is reserved")
-	}
-	var overRecipient bool
-	e = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM campaign_rows r WHERE campaign_id=$1 AND NOT excluded GROUP BY recipient HAVING count(*)+(SELECT count(*) FROM messages m WHERE m.application_id=$2 AND m.recipient=r.recipient AND m.created_at>=now()-interval '1 hour')>$3)`, id, app, recipientLimit).Scan(&overRecipient)
-	if e != nil {
+	if e = tx.QueryRow(ctx, "SELECT count(*) FROM campaign_rows WHERE campaign_id=$1 AND NOT excluded", id).Scan(&count); e != nil {
 		return e
 	}
-	if overRecipient {
-		return fmt.Errorf("campaign exceeds recipient cooldown limits")
+	if e = tx.QueryRow(ctx, "SELECT coalesce(sum(1+cardinality(cc)) FILTER(WHERE created_at>=now()-interval '24 hours'),0),count(*) FILTER(WHERE status IN('queued','retry_wait','sending')) FROM messages WHERE application_id=$1", app).Scan(&used, &queued); e != nil {
+		return e
+	}
+	if count+queued > queueLimit*8/10 {
+		return fmt.Errorf("campaign exceeds application quota or queue capacity; transactional capacity is reserved")
 	}
 	if scheduled.Before(time.Now()) {
 		scheduled = time.Now()
@@ -500,6 +499,7 @@ func (a *App) startCampaign(ctx context.Context, id string, scheduled time.Time)
 		To, Template, Key string
 		Version           int
 		Vars              map[string]string
+		CC                []string
 	}
 	var items []item
 	for rows.Next() {
@@ -515,7 +515,30 @@ func (a *App) startCampaign(ctx context.Context, id string, scheduled time.Time)
 		}
 		items = append(items, i)
 	}
+	e = rows.Err()
 	rows.Close()
+	if e != nil {
+		return e
+	}
+	additions := map[string]int{}
+	deliveries := 0
+	for index := range items {
+		i := &items[index]
+		if i.CC, e = normalizeCC(i.To, campaignCC); e != nil {
+			return e
+		}
+		deliveries += 1 + len(i.CC)
+		additions[strings.ToLower(i.To)]++
+		for _, address := range i.CC {
+			additions[strings.ToLower(address)]++
+		}
+	}
+	if deliveries+used > daily*9/10 {
+		return fmt.Errorf("campaign exceeds daily recipient quota (including CC); transactional capacity is reserved")
+	}
+	if e = checkRecipientCapacity(ctx, tx, app, additions, recipientLimit); e != nil {
+		return e
+	}
 	relayID, relayError := senderRelayWith(ctx, tx, from)
 	if relayError != nil {
 		return relayError
@@ -526,7 +549,7 @@ func (a *App) startCampaign(ctx context.Context, id string, scheduled time.Time)
 			return e
 		}
 		mid := newID("msg_")
-		_, e = tx.Exec(ctx, `INSERT INTO messages(id,application_id,campaign_id,recipient,from_address,reply_to,subject,html,plain,class,idempotency_key,payload_hash,available_at,expires_at,relay_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'bulk',$10,$11,$12,$13,NULLIF($14,''))`, mid, app, id, i.To, from, reply, rendered.Subject, rendered.HTML, rendered.Plain, "campaign:"+id+":"+i.Key, i.Key, scheduled, scheduled.Add(7*24*time.Hour), relayID)
+		_, e = tx.Exec(ctx, `INSERT INTO messages(id,application_id,campaign_id,recipient,from_address,reply_to,subject,html,plain,class,idempotency_key,payload_hash,available_at,expires_at,relay_id,cc,from_name) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'bulk',$10,$11,$12,$13,NULLIF($14,''),$15,$16)`, mid, app, id, i.To, from, reply, rendered.Subject, rendered.HTML, rendered.Plain, "campaign:"+id+":"+i.Key, i.Key, scheduled, scheduled.Add(7*24*time.Hour), relayID, i.CC, fromName)
 		if e != nil {
 			return e
 		}
@@ -606,6 +629,8 @@ func (a *App) campaign(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "POST" {
 		action := r.FormValue("action")
 		switch action {
+		case "cc":
+			e = a.setCampaignCC(r.Context(), id, parseCC(r.FormValue("cc")))
 		case "import":
 			if data["state"] != "draft" {
 				e = fmt.Errorf("return campaign to draft before importing")
