@@ -83,6 +83,42 @@ errors before approval; do not guess missing or invalid addresses. Imports are
 limited to 5,000 data rows, 52 columns, and 8 MiB files. XLSX formulas/macros are
 not executed. Each tab can become a separate campaign.
 
+### Combine certificates into fewer emails
+
+For certificate mappings, set `combine_recipients: true`, `combined_template`
+to a template slug/ID, and `name_columns` to the zero-based name column indexes.
+Valid, included rows with the same recipient address, school and event form one
+email. Different campaigns, schools and events remain separate. Mailbox local
+part case is preserved; domain case is normalized. A team certificate joins the
+nonempty name cells. Invalid/duplicate rows still block approval; excluded items
+remain excluded when remapping or toggling grouping.
+
+The combined template must contain `{{certificate_list}}` in its HTML. Use
+shared wording such as `Certificates for {{school_name}}`, optional
+`{{certificate_count}}`, and the list in both HTML and plain text. Do not use
+single-certificate `{{award_text}}` or `{{certificate_url}}` in that template.
+Awards use each source row's rule `award_text`, falling back to its award cell.
+The list renders each participant/team name, award and HTTPS certificate link.
+HTML is generated and escaped by EDP; integrations cannot supply trusted HTML.
+Set the optional constant `certificate_link_text` to customize the link label.
+
+The renderer takes `variables.certificate_items` as a **JSON-encoded string**
+containing 1–5000 `{name, award, url, source_row?}` objects. For an independent
+preview, for example:
+
+```json
+{"variables":{"school_name":"Example School","certificate_count":"2","certificate_items":"[{\"name\":\"Alice\",\"award\":\"Winner\",\"url\":\"https://example.test/alice\"},{\"name\":\"Bob\",\"award\":\"Participation\",\"url\":\"https://example.test/bob\"}]"}}
+```
+
+Mapping populates these values automatically. `GET /v1/campaigns/{id}` exposes
+each email entry's `source_ordinals` with every original source row. CSV exports
+retain the first `source_row` and append `source_rows` and `certificate_count`.
+Exclusion changes regroup draft entries atomically; retrieve fresh row IDs after
+changing exclusions. Excluding a combined entry excludes all its certificates;
+return to individual rows by disabling grouping to exclude just one item. Quotas and delivery status
+are per outbound email. The imported source snapshot is preserved. Preparing,
+previewing or remapping never queues an email.
+
 `POST /v1/campaigns/{id}/{action}` accepts explicit `approve`, `draft`, `start`,
 `pause`, `resume`, `cancel`, `exclude`, or `test`. Send a JSON body (use `{}` when
 there are no parameters). A `test` actually sends email and needs message.send.

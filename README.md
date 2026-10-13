@@ -33,7 +33,9 @@ The expanded campaign/template API, Excel imports, image previews, webhooks, and
 - Statistics, charts, audit records, body-retention cleanup, authenticated Prometheus metrics, example alert rules, and backup/restore-check scripts.
 - Multiple named SMTP relays with exact sender-domain routes and optional strict restriction; read-only PMG API tracking, opt-in once-only fallback after confirmed permanent IP reputation rejection, and gateway outcome ingestion with a durable Postfix-log adapter; `remote_accepted` means the recipient's server accepted transport, not inbox placement or reading.
 
-OTP generation/verification, certificate PDF generation, and file attachments remain outside this release scope. There is no MCP server; automation uses the service API. Certificate dispatch sends existing links. Multiple awards to the same recipient remain distinct dispatches; exact duplicate recipient/school/event/award/link rows require exclusion or correction.
+OTP generation/verification, certificate PDF generation, and file attachments remain outside this release scope. There is no MCP server; automation uses the service API. Certificate dispatch sends existing links. Exact duplicate recipient/school/event/award/link rows require exclusion or correction.
+
+`v1.2.1` adds **Combine certificates** in certificate mapping: one email per recipient, school and event with a list of participant names, awards and links. Choose a combined template containing `{{certificate_list}}` and select the name columns (including all members for team certificates). Original source row references remain visible in review/API/export. Invalid and excluded rows remain separate; remapping preserves exclusions. Different campaigns, schools and events stay separate. Grouping is off by default and requires migration 010; existing installations and approved campaigns keep their original behavior. See [the API guide](api/guide.md#combine-certificates-into-fewer-emails) for automation and preview examples.
 
 ## Authentication and access
 
@@ -193,11 +195,11 @@ A trusted gateway integration can submit:
 Copy `.env.production.example` to `.env.production`, set a real PostgreSQL connection, `PUBLIC_URL`, a stable 32-byte base64 `SECRET_KEY`, root bootstrap credentials, a primary SMTP endpoint (or configure it after root login). Configure SMTP authentication, PMG, and OIDC through Settings or bootstrap environment values. Put HTTPS termination in front of the localhost-bound web port. Development defaults are not used by `compose.production.yaml`.
 
 ```sh
-EDP_IMAGE=ghcr.io/mwit-msc/email-delivery-platform:v1.2.0 \
+EDP_IMAGE=ghcr.io/mwit-msc/email-delivery-platform:v1.2.1 \
   docker compose -f compose.production.yaml up -d
 ```
 
-When upgrading, back up PostgreSQL and retain the existing `SECRET_KEY`, credentials, and database volume. Run the new image's `migrate` command before starting its web/worker processes; the production Compose migration service does this automatically. New numbered migrations preserve existing applications, root passwords, templates, and legacy SMTP behavior. Do not run `reset-root`, delete volumes, or replace the encryption key as an upgrade step. Replace all web and worker instances with the new image before configuring named relay routes; older workers do not understand domain routing. Source updates that change embedded views/assets require rebuilding the image.
+When upgrading, back up PostgreSQL and retain the existing `SECRET_KEY`, credentials, and database volume. Run the new image's `migrate` command before starting its web/worker processes; the production Compose migration service does this automatically. New numbered migrations preserve existing applications, root passwords, templates, and legacy SMTP behavior. Do not run `reset-root`, delete volumes, or replace the encryption key as an upgrade step. Replace all web and worker instances with the new image before configuring named relay routes; older workers do not understand domain routing. For v1.2.1, replace every web and worker instance before enabling combined certificates: older processes do not understand the structured certificate list. Migration 010 adds source row references without regrouping existing or approved campaigns. Source updates that change embedded views/assets require rebuilding the image.
 
 Only migrations and the root are seeded in production. Configure authorized applications/senders, roles, and quotas in the dashboard. PostgreSQL must be backed up; it owns users, policies, jobs, snapshots, and delivery history. `scripts/backup.sh` backs up the local stack in custom pg_dump format with private file permissions. `scripts/restore-check.sh BACKUP.dump` verifies the dump in a new database without replacing live data. Production backups should use the deployed PostgreSQL backup system and retain `SECRET_KEY` separately.
 

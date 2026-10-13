@@ -54,8 +54,16 @@ func validAddress(s string) bool {
 }
 func renderVariables(s string, vars map[string]string, escape bool) (string, error) {
 	var missing string
+	var listError error
 	out := placeholders.ReplaceAllStringFunc(s, func(match string) string {
 		key := placeholders.FindStringSubmatch(match)[1]
+		if key == "certificate_list" && vars["certificate_items"] != "" {
+			value, err := certificateList(vars["certificate_items"], vars["certificate_link_text"], escape)
+			if err != nil {
+				listError = err
+			}
+			return value
+		}
 		v, ok := vars[key]
 		if !ok || strings.TrimSpace(v) == "" {
 			missing = key
@@ -73,6 +81,9 @@ func renderVariables(s string, vars map[string]string, escape bool) (string, err
 		}
 		return v
 	})
+	if listError != nil {
+		return "", listError
+	}
 	if missing != "" {
 		return "", fmt.Errorf("missing or invalid variable: %s", missing)
 	}
@@ -106,6 +117,9 @@ func renderMessageWith(ctx context.Context, query rowQuerier, app, slug string, 
 		return r, fmt.Errorf("template or version not found")
 	}
 	for _, k := range required {
+		if k == "certificate_list" && vars["certificate_items"] != "" {
+			k = "certificate_items"
+		}
 		if strings.TrimSpace(vars[k]) == "" {
 			return r, fmt.Errorf("missing variable: %s", k)
 		}

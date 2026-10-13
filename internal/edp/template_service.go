@@ -42,8 +42,12 @@ func prepareTemplate(in TemplateInput) (TemplateInput, []string, error) {
 	}
 	vars := []string{}
 	for _, m := range placeholders.FindAllStringSubmatch(in.Subject+in.HTML+in.Plain, -1) {
-		if !contains(vars, m[1]) {
-			vars = append(vars, m[1])
+		name := m[1]
+		if name == "certificate_list" {
+			name = "certificate_items"
+		}
+		if !contains(vars, name) {
+			vars = append(vars, name)
 		}
 	}
 	return in, vars, nil

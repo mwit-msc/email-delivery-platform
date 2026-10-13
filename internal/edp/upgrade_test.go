@@ -166,6 +166,11 @@ func TestReleasedV1UpgradePreservesDataAndDelivery(t *testing.T) {
 	if version != 2 || rowVersion != 1 || dispatch != "released-dispatch" || campaignState != "approved" || events != 1 {
 		t.Fatal("upgrade rewrote frozen templates, campaign rows, or delivery evidence")
 	}
+	var ordinal int
+	var sourceOrdinals []int
+	if err := a.DB.QueryRow(ctx, "SELECT ordinal,source_ordinals FROM campaign_rows WHERE campaign_id='cmp_released'").Scan(&ordinal, &sourceOrdinals); err != nil || len(sourceOrdinals) != 1 || sourceOrdinals[0] != ordinal {
+		t.Fatal("upgrade lost the released campaign's source row", err, sourceOrdinals)
+	}
 	var owner *string
 	if err := a.DB.QueryRow(ctx, "SELECT created_by FROM api_keys WHERE id='key_released'").Scan(&owner); err != nil || owner != nil {
 		t.Fatal("upgrade assigned a false human identity to a legacy service key", err)

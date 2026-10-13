@@ -35,6 +35,8 @@ window.edpInitEditor = async function(container, signal) {
       if (name==='school_name') return 'Example School';
       if (name==='certificate_url') return 'https://example.test/certificate';
       if (name==='logo_url') return find('#logo-url')?.value.trim() || 'https://example.test/logo.png';
+      if (name==='certificate_items') return JSON.stringify([{name:'Example Recipient',award:'Participation',url:'https://example.test/certificate'}]);
+      if (name==='certificate_count') return '1';
       if (name.endsWith('_url') || name==='url') return 'https://example.test';
       if (name==='email' || name.endsWith('_email')) return 'person@example.test';
       if (name==='name' || name==='recipient_name') return 'Example Recipient';
@@ -48,7 +50,8 @@ window.edpInitEditor = async function(container, signal) {
       if (!values || typeof values!=='object' || Array.isArray(values) || Object.values(values).some(value=>typeof value!=='string')) throw new Error('Preview variables must be an object with text values.');
       const names=new Set([...(data.variables || []),...Array.from((input.subject+input.html+input.plain).matchAll(/\{\{\s*([A-Za-z][A-Za-z0-9_]*)\s*\}\}/g),match=>match[1])]);
       let added=false;
-      for (const name of names) {
+      for (let name of names) {
+        if (name==='certificate_list') name='certificate_items';
         if (!Object.hasOwn(values,name)) {Object.defineProperty(values,name,{value:exampleValue(name),enumerable:true,writable:true,configurable:true});added=true;}
       }
       if (added || field.value==='{}') field.value=JSON.stringify(values,null,2);

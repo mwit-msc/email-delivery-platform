@@ -5,6 +5,7 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"github.com/jackc/pgx/v5"
 	"golang.org/x/oauth2/google"
 	"io"
 	"net/http"
@@ -164,6 +165,9 @@ type Mapping struct {
 	Columns              map[string]int    `json:"columns"`
 	Constants            map[string]string `json:"constants"`
 	SkipRowsWithoutEmail bool              `json:"skip_rows_without_email"`
+	CombineRecipients    bool              `json:"combine_recipients"`
+	CombinedTemplate     string            `json:"combined_template"`
+	NameColumns          []int             `json:"name_columns"`
 }
 
 type AwardRule struct {
@@ -199,6 +203,29 @@ func cell(row []string, n int) string {
 	return strings.TrimSpace(row[n])
 }
 func (a *App) mapCampaign(ctx context.Context, id string, m Mapping) error {
+	tx, e := a.DB.Begin(ctx)
+	if e != nil {
+		return e
+	}
+	defer tx.Rollback(ctx)
+	if e = a.mapCampaignWith(ctx, tx, id, m); e != nil {
+		return e
+	}
+	return tx.Commit(ctx)
+}
+
+func (a *App) mapCampaignWith(ctx context.Context, tx pgx.Tx, id string, m Mapping) error {
+	if m.CombineRecipients && (m.CombinedTemplate == "" || len(m.NameColumns) == 0) {
+		return fmt.Errorf("combining certificates requires a combined template and participant name columns")
+	}
+	if len(m.NameColumns) > 52 {
+		return fmt.Errorf("at most 52 participant name columns")
+	}
+	for _, column := range m.NameColumns {
+		if column < 0 || column > 51 {
+			return fmt.Errorf("invalid participant name column")
+		}
+	}
 	if len(m.Rules) > 1000 {
 		return fmt.Errorf("at most 1000 award mapping rules")
 	}
@@ -218,14 +245,9 @@ func (a *App) mapCampaign(ctx context.Context, id string, m Mapping) error {
 			}
 		}
 	}
-	tx, e := a.DB.Begin(ctx)
-	if e != nil {
-		return e
-	}
-	defer tx.Rollback(ctx)
 	var app, state string
 	var data []byte
-	e = tx.QueryRow(ctx, "SELECT application_id,state,source_rows FROM campaigns WHERE id=$1 FOR UPDATE", id).Scan(&app, &state, &data)
+	e := tx.QueryRow(ctx, "SELECT application_id,state,source_rows FROM campaigns WHERE id=$1 FOR UPDATE", id).Scan(&app, &state, &data)
 	if e != nil {
 		return e
 	}
@@ -239,10 +261,53 @@ func (a *App) mapCampaign(ctx context.Context, id string, m Mapping) error {
 	if len(rows) < 2 {
 		return fmt.Errorf("import data first")
 	}
+	// A mapping change must not silently include previously excluded certificates.
+	excluded := map[int]bool{}
+	prior, e := tx.Query(ctx, "SELECT ordinal,source_ordinals FROM campaign_rows WHERE campaign_id=$1 AND excluded", id)
+	if e != nil {
+		return e
+	}
+	for prior.Next() {
+		var ordinal int
+		var sources []int
+		if e = prior.Scan(&ordinal, &sources); e != nil {
+			prior.Close()
+			return e
+		}
+		if len(sources) == 0 {
+			sources = []int{ordinal}
+		}
+		for _, source := range sources {
+			excluded[source] = true
+		}
+	}
+	e = prior.Err()
+	prior.Close()
+	if e != nil {
+		return e
+	}
+	var combinedID string
+	var combinedVersion int
+	if m.CombineRecipients {
+		var content, subject, plain string
+		e = tx.QueryRow(ctx, `SELECT t.id,t.current_version,v.html,v.subject,v.plain FROM templates t JOIN template_versions v ON v.template_id=t.id AND v.version=t.current_version WHERE t.application_id=$1 AND (t.slug=$2 OR t.id=$2)`, app, m.CombinedTemplate).Scan(&combinedID, &combinedVersion, &content, &subject, &plain)
+		if e != nil || !hasCertificateList(content) {
+			return fmt.Errorf("combined template must belong to this application and contain {{certificate_list}} in its HTML")
+		}
+		if !hasCertificateList(plain) {
+			return fmt.Errorf("combined template plain text must also contain {{certificate_list}}")
+		}
+		for _, match := range placeholders.FindAllStringSubmatch(content+subject+plain, -1) {
+			if match[1] == "certificate_url" || match[1] == "award_text" {
+				return fmt.Errorf("combined templates must use {{certificate_list}} instead of single-certificate URL or award placeholders")
+			}
+		}
+	}
 	if _, e = tx.Exec(ctx, "DELETE FROM campaign_rows WHERE campaign_id=$1", id); e != nil {
 		return e
 	}
 	seen := map[string]bool{}
+	var mapped []mappedCertificateRow
 	for i, row := range rows[1:] {
 		email, school, event, award, link := cell(row, m.Email), cell(row, m.School), cell(row, m.Event), cell(row, m.Award), cell(row, m.URL)
 		if m.SkipRowsWithoutEmail && email == "" {
@@ -274,7 +339,11 @@ func (a *App) mapCampaign(ctx context.Context, id string, m Mapping) error {
 		if rule != nil {
 			slug = rule.Template
 		}
-		err = tx.QueryRow(ctx, "SELECT id,current_version FROM templates WHERE application_id=$1 AND (slug=$2 OR id=$2)", app, slug).Scan(&tid, &v)
+		if m.CombineRecipients {
+			tid, v, err = combinedID, combinedVersion, nil
+		} else {
+			err = tx.QueryRow(ctx, "SELECT id,current_version FROM templates WHERE application_id=$1 AND (slug=$2 OR id=$2)", app, slug).Scan(&tid, &v)
+		}
 		if err != nil {
 			errs = append(errs, "No template for event/award: "+event+"/"+award)
 		} else {
@@ -295,6 +364,20 @@ func (a *App) mapCampaign(ctx context.Context, id string, m Mapping) error {
 				vars[key] = value
 			}
 		}
+		if m.CombineRecipients {
+			var names []string
+			for _, column := range m.NameColumns {
+				if name := cell(row, column); name != "" {
+					names = append(names, name)
+				}
+			}
+			wording := vars["award_text"]
+			if wording == "" {
+				wording = award
+			}
+			items, _ := json.Marshal([]CertificateItem{{Name: strings.Join(names, " / "), Award: wording, URL: link, SourceRow: i + 2}})
+			vars["certificate_items"], vars["certificate_count"] = string(items), "1"
+		}
 		if tpl != nil {
 			if _, err := renderMessageWith(ctx, tx, app, tid, v, vars); err != nil {
 				errs = append(errs, err.Error())
@@ -308,8 +391,25 @@ func (a *App) mapCampaign(ctx context.Context, id string, m Mapping) error {
 		if errs == nil {
 			errs = []string{}
 		}
-		data, _ := json.Marshal(vars)
-		if _, e = tx.Exec(ctx, "INSERT INTO campaign_rows(id,campaign_id,ordinal,recipient,template_id,template_version,variables,errors,dispatch_key) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)", newID("row_"), id, i+2, email, tpl, version, data, errs, dispatch); e != nil {
+		groupKey, _ := json.Marshal([]string{certificateRecipientKey(email), school, event})
+		mapped = append(mapped, mappedCertificateRow{Ordinal: i + 2, Recipient: email, Template: tpl, Version: version, Variables: vars, Errors: errs, Dispatch: dispatch, Sources: []int{i + 2}, Excluded: excluded[i+2], GroupKey: string(groupKey)})
+	}
+	if m.CombineRecipients {
+		if mapped, e = combineCertificateRows(mapped); e != nil {
+			return e
+		}
+		for i := range mapped {
+			row := &mapped[i]
+			if len(row.Errors) == 0 {
+				if _, err := renderMessageWith(ctx, tx, app, combinedID, combinedVersion, row.Variables); err != nil {
+					row.Errors = append(row.Errors, err.Error())
+				}
+			}
+		}
+	}
+	for _, row := range mapped {
+		data, _ := json.Marshal(row.Variables)
+		if _, e = tx.Exec(ctx, "INSERT INTO campaign_rows(id,campaign_id,ordinal,recipient,template_id,template_version,variables,errors,dispatch_key,source_ordinals,excluded) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)", newID("row_"), id, row.Ordinal, row.Recipient, row.Template, row.Version, data, row.Errors, row.Dispatch, row.Sources, row.Excluded); e != nil {
 			return e
 		}
 	}
@@ -317,7 +417,7 @@ func (a *App) mapCampaign(ctx context.Context, id string, m Mapping) error {
 	if _, e = tx.Exec(ctx, "UPDATE campaigns SET mapping=$2 WHERE id=$1", id, mapping); e != nil {
 		return e
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 func (a *App) approveCampaign(ctx context.Context, id, actor string) error {
 	tx, e := a.DB.Begin(ctx)
@@ -548,7 +648,15 @@ func (a *App) campaign(w http.ResponseWriter, r *http.Request) {
 				}
 				e = a.mapBulkCampaign(r.Context(), id, r.FormValue("template"), parse("email"), columns, constants)
 			} else {
-				m := Mapping{Email: parse("email"), School: parse("school"), Event: parse("event"), Award: parse("award"), URL: parse("url"), DefaultEvent: r.FormValue("default_event"), DefaultAward: r.FormValue("default_award"), SkipRowsWithoutEmail: r.FormValue("skip_empty_email") == "on"}
+				m := Mapping{Email: parse("email"), School: parse("school"), Event: parse("event"), Award: parse("award"), URL: parse("url"), DefaultEvent: r.FormValue("default_event"), DefaultAward: r.FormValue("default_award"), SkipRowsWithoutEmail: r.FormValue("skip_empty_email") == "on", CombineRecipients: r.FormValue("combine_recipients") == "on", CombinedTemplate: r.FormValue("combined_template")}
+				for _, value := range r.Form["name_columns"] {
+					column, err := strconv.Atoi(value)
+					if err != nil {
+						problem(w, 400, "invalid participant name column")
+						return
+					}
+					m.NameColumns = append(m.NameColumns, column)
+				}
 				// Certificate forms do not expose API column/constant mappings.
 				// Retain these values when an organizer changes an award selection.
 				var previous Mapping
@@ -557,9 +665,12 @@ func (a *App) campaign(w http.ResponseWriter, r *http.Request) {
 					m.Columns, m.Constants = previous.Columns, previous.Constants
 				}
 				for key := range r.Form {
-					if strings.HasPrefix(key, "rule.") && r.FormValue(key) != "" {
+					if strings.HasPrefix(key, "rule.") && (r.FormValue(key) != "" || m.CombineRecipients) {
 						award := strings.TrimPrefix(key, "rule.")
 						rule := AwardRule{Award: award, Template: r.FormValue(key)}
+						if rule.Template == "" {
+							rule.Template = m.CombinedTemplate
+						}
 						if raw := strings.TrimSpace(r.FormValue("rule_vars." + award)); raw != "" {
 							if err := json.Unmarshal([]byte(raw), &rule.Variables); err != nil {
 								problem(w, 400, "award variables must be a JSON object of text values")
@@ -627,6 +738,25 @@ func (a *App) campaign(w http.ResponseWriter, r *http.Request) {
 	mapping := Mapping{Email: -1, School: -1, Event: -1, Award: -1, URL: -1}
 	rawMapping, _ := json.Marshal(data["mapping"])
 	json.Unmarshal(rawMapping, &mapping)
+	nameColumns := map[int]bool{}
+	for _, column := range mapping.NameColumns {
+		nameColumns[column] = true
+	}
+	certificates := 0
+	for _, row := range rows {
+		var sources []int
+		raw, _ := json.Marshal(row["source_ordinals"])
+		json.Unmarshal(raw, &sources)
+		if len(sources) == 0 {
+			sources = []int{int(row["ordinal"].(int32))}
+		}
+		labels := make([]string, len(sources))
+		for i, source := range sources {
+			labels[i] = strconv.Itoa(source)
+		}
+		row["source_label"], row["certificate_count"] = strings.Join(labels, ", "), len(sources)
+		certificates += len(sources)
+	}
 	if mapping.Email < 0 {
 		for i, h := range headers {
 			lower := strings.ToLower(h)
@@ -653,7 +783,7 @@ func (a *App) campaign(w http.ResponseWriter, r *http.Request) {
 			ruleVariables[rule.Award] = string(raw)
 		}
 	}
-	a.render(w, r, "campaign", map[string]any{"Campaign": data, "Rows": rows, "Headers": headers, "Awards": sourceAwards(source), "Mapping": mapping, "RuleSelections": ruleSelections, "RuleVariables": ruleVariables, "Scope": scope, "SheetConfigured": a.C.GoogleCredentials != "", "Templates": templates, "SelectedTemplate": selected, "TemplateVariables": variables})
+	a.render(w, r, "campaign", map[string]any{"Campaign": data, "Rows": rows, "Headers": headers, "Awards": sourceAwards(source), "Mapping": mapping, "NameColumns": nameColumns, "CertificateCount": certificates, "RuleSelections": ruleSelections, "RuleVariables": ruleVariables, "Scope": scope, "SheetConfigured": a.C.GoogleCredentials != "", "Templates": templates, "SelectedTemplate": selected, "TemplateVariables": variables})
 }
 func (a *App) campaignPreview(w http.ResponseWriter, r *http.Request) {
 	var scope, tid string
@@ -735,20 +865,39 @@ func (a *App) replaceCampaignSource(ctx context.Context, id string, rows [][]str
 	return tx.Commit(ctx)
 }
 func (a *App) toggleCampaignRow(ctx context.Context, id, row string) error {
+	return a.setCampaignRowExcluded(ctx, id, row, nil)
+}
+
+func (a *App) setCampaignRowExcluded(ctx context.Context, id, row string, excluded *bool) error {
 	tx, e := a.DB.Begin(ctx)
 	if e != nil {
 		return e
 	}
 	defer tx.Rollback(ctx)
-	var state string
-	if e = tx.QueryRow(ctx, "SELECT state FROM campaigns WHERE id=$1 FOR UPDATE", id).Scan(&state); e != nil {
+	var state, kind string
+	var raw []byte
+	if e = tx.QueryRow(ctx, "SELECT state,kind,mapping FROM campaigns WHERE id=$1 FOR UPDATE", id).Scan(&state, &kind, &raw); e != nil {
 		return e
 	}
 	if state != "draft" {
 		return fmt.Errorf("only draft rows may change")
 	}
-	if _, e = tx.Exec(ctx, "UPDATE campaign_rows SET excluded=NOT excluded WHERE campaign_id=$1 AND id=$2", id, row); e != nil {
+	var current bool
+	if e = tx.QueryRow(ctx, "SELECT excluded FROM campaign_rows WHERE campaign_id=$1 AND id=$2", id, row).Scan(&current); e != nil {
+		return fmt.Errorf("row not found")
+	}
+	value := !current
+	if excluded != nil {
+		value = *excluded
+	}
+	if _, e = tx.Exec(ctx, "UPDATE campaign_rows SET excluded=$3 WHERE campaign_id=$1 AND id=$2", id, row, value); e != nil {
 		return e
+	}
+	var mapping Mapping
+	if kind == "certificate" && current != value && json.Unmarshal(raw, &mapping) == nil && mapping.CombineRecipients {
+		if e = a.mapCampaignWith(ctx, tx, id, mapping); e != nil {
+			return e
+		}
 	}
 	return tx.Commit(ctx)
 }

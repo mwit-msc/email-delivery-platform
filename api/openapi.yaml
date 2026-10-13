@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Email Delivery Platform
-  version: 1.2.0
+  version: 1.2.1
   description: Application-scoped bearer API for durable delivery, templates, campaigns, assets, and webhooks.
     relay.manage is a privileged platform-wide permission. Expanded API operations reject unknown JSON
     fields and multiple JSON values.
@@ -199,6 +199,25 @@ components:
           type: boolean
           default: false
           description: Skip rows whose mapped email cell is empty, such as worksheet footers.
+        combine_recipients:
+          type: boolean
+          default: false
+          description: Combine valid, included certificates with the same recipient, school and event
+            into one email. Invalid and excluded source rows remain separate. Does not combine campaigns.
+        combined_template:
+          type: string
+          description: Template slug or ID required when combining. HTML and plain text must contain
+            the safe '{{certificate_list}}' block; single-certificate certificate_url and award_text placeholders
+            are disallowed. Selected version and item data are frozen with the mapping.
+        name_columns:
+          type: array
+          maxItems: 52
+          items:
+            type: integer
+            minimum: 0
+            maximum: 51
+          description: Participant name columns, required when combining. Multiple nonempty cells
+            are joined for a team certificate. Item awards use rule award_text or the original award.
       additionalProperties: false
       required:
       - email

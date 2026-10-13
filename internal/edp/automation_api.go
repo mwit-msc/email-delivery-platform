@@ -365,26 +365,7 @@ func (a *App) actCampaign(ctx context.Context, id, app, actor, action string, in
 		}
 		return tx.Commit(ctx)
 	case "exclude":
-		tx, e := a.DB.Begin(ctx)
-		if e != nil {
-			return e
-		}
-		defer tx.Rollback(ctx)
-		var state string
-		if e = tx.QueryRow(ctx, "SELECT state FROM campaigns WHERE id=$1 FOR UPDATE", id).Scan(&state); e != nil {
-			return e
-		}
-		if state != "draft" {
-			return fmt.Errorf("only draft rows can be excluded")
-		}
-		tag, e := tx.Exec(ctx, "UPDATE campaign_rows SET excluded=$3 WHERE id=$1 AND campaign_id=$2", in.RowID, id, in.Excluded)
-		if e != nil {
-			return e
-		}
-		if tag.RowsAffected() != 1 {
-			return fmt.Errorf("row not found")
-		}
-		return tx.Commit(ctx)
+		return a.setCampaignRowExcluded(ctx, id, in.RowID, &in.Excluded)
 	case "test":
 		var tid string
 		var v int
@@ -427,7 +408,7 @@ func (a *App) campaignExport(w http.ResponseWriter, r *http.Request) {
 	if !a.require(w, r, app, "campaign.view") {
 		return
 	}
-	rows, e := a.DB.Query(r.Context(), `SELECT r.ordinal,r.recipient,coalesce(t.slug,''),r.excluded,r.errors,coalesce(m.id,''),coalesce(m.status,''),coalesce(m.attempts,0),coalesce(m.last_error,'') FROM campaign_rows r LEFT JOIN templates t ON t.id=r.template_id LEFT JOIN messages m ON m.campaign_id=r.campaign_id AND m.idempotency_key='campaign:'||r.campaign_id||':'||r.dispatch_key WHERE r.campaign_id=$1 ORDER BY r.ordinal`, id)
+	rows, e := a.DB.Query(r.Context(), `SELECT r.ordinal,r.recipient,coalesce(t.slug,''),r.excluded,r.errors,coalesce(m.id,''),coalesce(m.status,''),coalesce(m.attempts,0),coalesce(m.last_error,''),r.source_ordinals FROM campaign_rows r LEFT JOIN templates t ON t.id=r.template_id LEFT JOIN messages m ON m.campaign_id=r.campaign_id AND m.idempotency_key='campaign:'||r.campaign_id||':'||r.dispatch_key WHERE r.campaign_id=$1 ORDER BY r.ordinal`, id)
 	if e != nil {
 		problem(w, 500, "export unavailable")
 		return
@@ -437,16 +418,24 @@ func (a *App) campaignExport(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", `attachment; filename="campaign-results.csv"`)
 	w.Write([]byte{0xef, 0xbb, 0xbf})
 	out := csv.NewWriter(w)
-	out.Write([]string{"source_row", "recipient", "template", "excluded", "validation_errors", "message_id", "status", "attempts", "delivery_detail"})
+	out.Write([]string{"source_row", "recipient", "template", "excluded", "validation_errors", "message_id", "status", "attempts", "delivery_detail", "source_rows", "certificate_count"})
 	for rows.Next() {
 		var ordinal, attempts int
 		var recipient, slug, mid, status, detail string
 		var excluded bool
 		var errs []string
-		if e = rows.Scan(&ordinal, &recipient, &slug, &excluded, &errs, &mid, &status, &attempts, &detail); e != nil {
+		var sources []int
+		if e = rows.Scan(&ordinal, &recipient, &slug, &excluded, &errs, &mid, &status, &attempts, &detail, &sources); e != nil {
 			break
 		}
-		record := []string{strconv.Itoa(ordinal), recipient, slug, strconv.FormatBool(excluded), strings.Join(errs, "; "), mid, status, strconv.Itoa(attempts), detail}
+		if len(sources) == 0 {
+			sources = []int{ordinal}
+		}
+		labels := make([]string, len(sources))
+		for i, source := range sources {
+			labels[i] = strconv.Itoa(source)
+		}
+		record := []string{strconv.Itoa(ordinal), recipient, slug, strconv.FormatBool(excluded), strings.Join(errs, "; "), mid, status, strconv.Itoa(attempts), detail, strings.Join(labels, "; "), strconv.Itoa(len(sources))}
 		for i := range record {
 			record[i] = csvSafe(record[i])
 		}
