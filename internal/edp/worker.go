@@ -22,7 +22,8 @@ import (
 type delivery struct {
 	ID, AppID, Recipient, From, FromName, Reply, Subject, HTML, Plain, Lease, Route, RelayID, FallbackRelayID string
 	Attempts                                                                                                  int
-	CC                                                                                                        []string
+	CC, BCC                                                                                                   []string
+	OTPEncrypted                                                                                              bool
 }
 
 func (a *App) claim(ctx context.Context) (*delivery, error) {
@@ -51,7 +52,7 @@ func (a *App) claim(ctx context.Context) (*delivery, error) {
 		return nil, nil
 	}
 	d := &delivery{}
-	e = tx.QueryRow(ctx, `SELECT m.id,m.application_id,m.recipient,m.from_address,m.from_name,m.reply_to,m.subject,m.html,m.plain,m.route_attempts,m.route,coalesce(m.relay_id,''),coalesce(m.fallback_relay_id,'') ,m.cc FROM messages m JOIN applications a ON a.id=m.application_id LEFT JOIN campaigns c ON c.id=m.campaign_id WHERE m.status IN('queued','retry_wait') AND m.available_at<=now() AND m.expires_at>now() AND NOT a.paused AND a.next_send_at<=now() AND (m.campaign_id IS NULL OR c.state='sending') ORDER BY CASE WHEN $1::bigint%5=4 AND m.class='bulk' THEN -1 ELSE CASE m.class WHEN 'otp' THEN 0 WHEN 'transactional' THEN 1 ELSE 2 END END,a.next_send_at,m.available_at,m.created_at FOR UPDATE OF m SKIP LOCKED LIMIT 1`, dispatchCounter).Scan(&d.ID, &d.AppID, &d.Recipient, &d.From, &d.FromName, &d.Reply, &d.Subject, &d.HTML, &d.Plain, &d.Attempts, &d.Route, &d.RelayID, &d.FallbackRelayID, &d.CC)
+	e = tx.QueryRow(ctx, `SELECT m.id,m.application_id,m.recipient,m.from_address,m.from_name,m.reply_to,m.subject,m.html,m.plain,m.route_attempts,m.route,coalesce(m.relay_id,''),coalesce(m.fallback_relay_id,'') ,m.cc,m.bcc,m.otp_encrypted FROM messages m JOIN applications a ON a.id=m.application_id LEFT JOIN campaigns c ON c.id=m.campaign_id WHERE m.status IN('queued','retry_wait') AND m.available_at<=now() AND m.expires_at>now() AND NOT a.paused AND a.next_send_at<=now() AND (m.campaign_id IS NULL OR c.state='sending') ORDER BY CASE WHEN $1::bigint%5=4 AND m.class='bulk' THEN -1 ELSE CASE m.class WHEN 'otp' THEN 0 WHEN 'transactional' THEN 1 ELSE 2 END END,a.next_send_at,m.available_at,m.created_at FOR UPDATE OF m SKIP LOCKED LIMIT 1`, dispatchCounter).Scan(&d.ID, &d.AppID, &d.Recipient, &d.From, &d.FromName, &d.Reply, &d.Subject, &d.HTML, &d.Plain, &d.Attempts, &d.Route, &d.RelayID, &d.FallbackRelayID, &d.CC, &d.BCC, &d.OTPEncrypted)
 	if e == pgx.ErrNoRows {
 		return nil, nil
 	}
@@ -178,7 +179,12 @@ func (a *App) maintenance(ctx context.Context) {
 	tx.Exec(ctx, "DELETE FROM login_attempts WHERE expires_at<now()")
 	tx.Exec(ctx, "UPDATE messages SET html='',plain='' WHERE created_at<now()-$1::interval AND status NOT IN('queued','retry_wait','sending')", fmt.Sprintf("%d days", a.C.RetentionDays))
 	tx.Exec(ctx, "DELETE FROM webhook_jobs WHERE status NOT IN('queued','sending') AND created_at<now()-$1::interval", fmt.Sprintf("%d days", a.C.RetentionDays))
-	tx.Commit(ctx)
+	if tx.Commit(ctx) != nil {
+		return
+	}
+	// Single statements keep cleanup from reversing admission/worker lock order.
+	a.DB.Exec(ctx, "UPDATE otp_challenges SET code_hash=''::bytea WHERE expires_at<=clock_timestamp() AND octet_length(code_hash)>0")
+	a.DB.Exec(ctx, "UPDATE messages m SET html='',plain='' WHERE m.otp_encrypted AND (m.html<>'' OR m.plain<>'') AND EXISTS(SELECT 1 FROM otp_challenges o WHERE o.message_id=m.id AND (o.expires_at<=clock_timestamp() OR o.consumed_at IS NOT NULL OR o.revoked_at IS NOT NULL OR o.attempts>=5))")
 }
 func makeMIME(d delivery, publicURL string) []byte {
 	var b bytes.Buffer
@@ -228,11 +234,26 @@ func smtpFailure(e error, uncertain bool) (string, string) {
 	return "retry_wait", "SMTP connection or temporary rejection; retry scheduled"
 }
 func (a *App) smtpSend(ctx context.Context, d delivery) (string, string) {
-	cc, err := normalizeCC(d.Recipient, d.CC)
+	cc, bcc, err := normalizeCopies(d.Recipient, d.CC, d.BCC)
 	if err != nil {
 		return "failed", err.Error()
 	}
-	d.CC = cc
+	d.CC, d.BCC = cc, bcc
+	if d.OTPEncrypted {
+		var valid bool
+		if err := a.DB.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM otp_challenges WHERE message_id=$1 AND consumed_at IS NULL AND revoked_at IS NULL AND attempts<5 AND expires_at>clock_timestamp() AND octet_length(code_hash)>0)", d.ID).Scan(&valid); err != nil {
+			return "retry_wait", "OTP challenge is unavailable"
+		}
+		if !valid {
+			return "expired", "OTP challenge is no longer valid"
+		}
+		if d.HTML, err = unseal(a.C.Secret, d.HTML); err != nil {
+			return "failed", "OTP content could not be decrypted"
+		}
+		if d.Plain, err = unseal(a.C.Secret, d.Plain); err != nil {
+			return "failed", "OTP content could not be decrypted"
+		}
+	}
 	config, configErr := a.runtimeConfig(ctx)
 	if configErr != nil {
 		return "retry_wait", "Runtime configuration is unavailable"
@@ -313,7 +334,7 @@ func (a *App) smtpSend(ctx context.Context, d delivery) (string, string) {
 	}
 	// Recheck suspension immediately before crossing the SMTP boundary.
 	var allowed bool
-	e = a.DB.QueryRow(ctx, `SELECT NOT p.paused AND NOT a.paused AND m.status='sending' AND m.lease_token=$2 AND m.expires_at>now() AND (m.campaign_id IS NULL OR c.state='sending') AND (m.route<>'secondary' OR a.fallback_enabled) AND (m.route<>'secondary' OR coalesce(m.relay_id,'')=coalesce((SELECT relay_id FROM sender_domain_routes WHERE domain=$3),'')) AND (m.route<>'primary' OR $4=coalesce((SELECT relay_id FROM sender_domain_routes WHERE domain=$3),'')) AND (m.route<>'secondary' OR m.relay_id IS NULL OR EXISTS(SELECT 1 FROM smtp_relays s WHERE s.id=m.relay_id AND s.enabled AND $3=ANY(s.allowed_domains) AND s.fallback_id=$4)) AND (NOT p.strict_sender_domains OR EXISTS(SELECT 1 FROM sender_domain_routes dr JOIN smtp_relays sr ON sr.id=dr.relay_id WHERE dr.domain=$3 AND sr.enabled AND $3=ANY(sr.allowed_domains))) AND ($4='' OR EXISTS(SELECT 1 FROM smtp_relays sr WHERE sr.id=$4 AND sr.enabled AND $3=ANY(sr.allowed_domains))) FROM messages m JOIN applications a ON a.id=m.application_id CROSS JOIN platform_settings p LEFT JOIN campaigns c ON c.id=m.campaign_id WHERE m.id=$1 AND p.id=1`, d.ID, d.Lease, domain, relay).Scan(&allowed)
+	e = a.DB.QueryRow(ctx, `SELECT NOT p.paused AND NOT a.paused AND m.status='sending' AND m.lease_token=$2 AND m.expires_at>clock_timestamp() AND (NOT m.otp_encrypted OR EXISTS(SELECT 1 FROM otp_challenges o WHERE o.message_id=m.id AND o.consumed_at IS NULL AND o.revoked_at IS NULL AND o.attempts<5 AND o.expires_at>clock_timestamp() AND octet_length(o.code_hash)>0)) AND (m.campaign_id IS NULL OR c.state='sending') AND (m.route<>'secondary' OR a.fallback_enabled) AND (m.route<>'secondary' OR coalesce(m.relay_id,'')=coalesce((SELECT relay_id FROM sender_domain_routes WHERE domain=$3),'')) AND (m.route<>'primary' OR $4=coalesce((SELECT relay_id FROM sender_domain_routes WHERE domain=$3),'')) AND (m.route<>'secondary' OR m.relay_id IS NULL OR EXISTS(SELECT 1 FROM smtp_relays s WHERE s.id=m.relay_id AND s.enabled AND $3=ANY(s.allowed_domains) AND s.fallback_id=$4)) AND (NOT p.strict_sender_domains OR EXISTS(SELECT 1 FROM sender_domain_routes dr JOIN smtp_relays sr ON sr.id=dr.relay_id WHERE dr.domain=$3 AND sr.enabled AND $3=ANY(sr.allowed_domains))) AND ($4='' OR EXISTS(SELECT 1 FROM smtp_relays sr WHERE sr.id=$4 AND sr.enabled AND $3=ANY(sr.allowed_domains))) FROM messages m JOIN applications a ON a.id=m.application_id CROSS JOIN platform_settings p LEFT JOIN campaigns c ON c.id=m.campaign_id WHERE m.id=$1 AND p.id=1`, d.ID, d.Lease, domain, relay).Scan(&allowed)
 	if e != nil || !allowed {
 		return "retry_wait", "Dispatch paused, expired, or relay routing changed before SMTP submission"
 	}
@@ -330,7 +351,7 @@ func (a *App) smtpSend(ctx context.Context, d delivery) (string, string) {
 	if e = client.Rcpt(d.Recipient); e != nil {
 		return smtpFailure(e, false)
 	}
-	for _, address := range d.CC {
+	for _, address := range append(append([]string{}, d.CC...), d.BCC...) {
 		if e = client.Rcpt(address); e != nil {
 			// DATA is never submitted unless all recipients were accepted.
 			return smtpFailure(e, false)

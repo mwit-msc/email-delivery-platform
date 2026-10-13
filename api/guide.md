@@ -133,19 +133,19 @@ changing its payload conflicts. Check `GET /v1/messages/{id}` with message.view.
 Cancellation requires message.cancel and is effective only before dispatch.
 Messages have one To recipient and an optional `cc` array (up to 20 bare mailbox
 addresses). CC is persisted, included in the MIME Cc header and submitted as SMTP
-RCPT recipients. Duplicates and copies of To are removed. BCC is not supported.
-Daily recipient quota counts To plus CC; queue capacity counts message jobs.
-Recipient cooldowns include CC, including a shared copy mailbox on a campaign.
+RCPT recipients. Duplicates and copies of To are removed. Optional `bcc` uses the same mailbox format and is submitted only as SMTP RCPT, never in MIME headers. CC and BCC share a maximum of 20 unique copies; duplicates of To and across lists are removed (CC takes precedence).
+Daily recipient quota counts To plus CC and BCC; queue capacity counts message jobs.
+Recipient cooldowns include CC and BCC, including a shared copy mailbox on a campaign.
 
 Draft campaigns accept `cc` on creation or `POST /v1/campaigns/{id}/cc` with
 `{"cc":["copies@example.test"]}`; use `{"cc":[]}` to clear. Approval freezes the
-list. Return an approved, unsent campaign to draft before changing CC, then
+list. Return an approved, unsent campaign to draft before changing CC or BCC, then
 approve it again. Saving CC and approving never queue mail. Campaign tests
-intentionally omit CC and send only to the supplied test address.
+intentionally omit CC and BCC and send only to the supplied test address.
 
 All SMTP RCPT commands must succeed before DATA is submitted. Remote delivery
-status/PMG evidence tracks the primary To recipient; CC delivery is not tracked
-separately. After the gateway accepts a message with CC, a remote To rejection
+status/PMG evidence tracks the primary To recipient; CC and BCC delivery are not tracked
+separately. After the gateway accepts a message with CC or BCC, a remote To rejection
 cannot trigger whole-message fallback, since it could duplicate an accepted
 copy. Confirmed rejection before gateway acceptance can still use the existing
 opt-in, once-only fallback.
@@ -192,3 +192,38 @@ is independent of the email-body logo and requires the provider's BIMI setup.
 Since v1.3.0, SMTP configuration uses named relays only. The upgrade converts
 legacy settings, preserves credentials/fallbacks and existing named routes, and
 requires an exact enabled sender-domain route. `strict:false` is rejected.
+
+### Campaign snapshots and relay deletion
+
+`POST /v1/campaigns/{id}/bcc` with `{"bcc":["archive@example.test"]}` sets draft blind copies; an empty array clears them. Campaign creation also accepts `bcc`. The same draft locks, approval freeze and recipient limits apply to CC and BCC.
+
+Completed campaign pages show saved mappings and frozen template versions. Bulk mappings created before this feature were not saved and cannot be reconstructed. `GET /v1/campaigns/{id}/source?format=csv` requires `campaign.view` and downloads the normalized imported snapshot, including headers, excluded and skipped rows. CSV has a UTF-8 BOM and escapes formula-leading strings; `format=json` returns `{"rows":[...]}` with exact stored cell values. The original workbook file is not retained.
+
+`DELETE /v1/relays/{id}` requires privileged `relay.manage` and returns 204. A referenced relay returns 409: remove its sender-domain routes and other relays’ fallback links first. Relays referenced by messages must remain for delivery history; disable them instead.
+
+### Email OTP generation and verification
+
+Use dedicated backend service credentials with `otp.create` and `otp.verify`; neither scope grants general message sending. Keep credentials server-side. Creation requires a payload-sensitive `Idempotency-Key`:
+
+```sh
+curl "$EDP_URL/v1/otp/challenges" \
+  -H "Authorization: Bearer $EDP_API_KEY" \
+  -H 'Idempotency-Key: login-attempt-42' \
+  -H 'Content-Type: application/json' \
+  -d '{"to":"person@example.test","purpose":"login"}'
+```
+
+A committed response is `202` with `id`, `message_id`, `expires_at`, and `replayed`. Delivery is asynchronous. EDP generates and emails a six-digit string that expires five minutes after challenge creation; the API never returns the code. The fixed verification email needs no template and accepts no copies. Creation normalizes mailbox domain casing and trims whitespace; purposes are normalized lowercase labels up to 64 characters. Use the normalized purpose when verifying.
+
+```sh
+curl "$EDP_URL/v1/otp/challenges/$EDP_OTP_ID/verify" \
+  -H "Authorization: Bearer $EDP_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"purpose":"login","code":"012345"}'
+```
+
+Success is `200` with `{"verified":true,"to":"person@example.test","purpose":"login"}` and consumes the challenge atomically. Keep the ID tied to the expected mailbox/purpose in your backend, compare successful recipient metadata, then create your own session or perform the intended operation. Challenge IDs alone do not identify a user. Preserve leading zeroes in codes. Incorrect guesses and wrong purposes consume one of five attempts; all invalid, exhausted, consumed, revoked, unknown, foreign-app and expired challenges return `{"verified":false}` with no recipient metadata. Invalid JSON or missing fields returns 400.
+
+Creation shares a 60-second per-recipient cooldown across purposes in one app, and uses existing daily/recipient/queue quotas. 429 includes Retry-After. Retry the same creation key to recover the same response; it does not reset expiry, attempts or consumption, even when expired. Resend with a new key after the cooldown; a same-purpose replacement revokes the old challenge and cancels pending email atomically. If admission fails the original remains valid. Already submitted mail cannot be recalled, so tie verification to the latest expected challenge. Different purposes remain independent.
+
+Generated bodies are encrypted and hidden from previews; verifier/body data is erased after consumption, exhaustion, supersession or expiry. Worker-owned rows and expired data are cleared on the next 30-second maintenance cycle. Metadata remains for idempotency/history. Do not include codes in application logs. Check delivery status using `GET /v1/messages/{message_id}` and `message.view` if needed. Update all web/workers after migration 015 before using generated OTPs; legacy caller-rendered `class:otp` messages retain their behavior. `edp:otp:` is a reserved internal message idempotency namespace.

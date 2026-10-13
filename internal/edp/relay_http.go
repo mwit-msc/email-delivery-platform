@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 func relayForm(r *http.Request) RelayInput {
@@ -20,6 +22,8 @@ func (a *App) relaySettingsAction(w http.ResponseWriter, r *http.Request) bool {
 	switch action {
 	case "relay.save":
 		_, e = a.saveRelay(r.Context(), relayForm(r))
+	case "relay.delete":
+		e = a.deleteRelay(r.Context(), r.FormValue("relay_id"))
 	case "relay.test":
 		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
 		defer cancel()
@@ -47,6 +51,20 @@ func (a *App) relaySettingsAction(w http.ResponseWriter, r *http.Request) bool {
 }
 func (a *App) apiRelays(w http.ResponseWriter, r *http.Request) {
 	if _, ok := a.apiScope(w, r, "relay.manage"); !ok {
+		return
+	}
+	if r.Method == "DELETE" {
+		id := r.PathValue("id")
+		if err := a.deleteRelay(r.Context(), id); err != nil {
+			if err == pgx.ErrNoRows {
+				problem(w, 404, "relay not found")
+			} else {
+				problem(w, 409, err.Error())
+			}
+			return
+		}
+		a.audit(r.Context(), person(r).ID, "relay.delete", "*", id)
+		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	if r.Method == "GET" {

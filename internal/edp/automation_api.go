@@ -119,7 +119,7 @@ func (a *App) apiCampaigns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if r.Method == "GET" {
-		rows, e := a.query(r.Context(), "SELECT id,name,kind,state,approved_at,scheduled_at,created_at,cc FROM campaigns WHERE application_id=$1 ORDER BY created_at DESC LIMIT 1000", app)
+		rows, e := a.query(r.Context(), "SELECT id,name,kind,state,approved_at,scheduled_at,created_at,cc,bcc FROM campaigns WHERE application_id=$1 ORDER BY created_at DESC LIMIT 1000", app)
 		if e != nil {
 			problem(w, 500, "campaigns unavailable")
 			return
@@ -131,6 +131,7 @@ func (a *App) apiCampaigns(w http.ResponseWriter, r *http.Request) {
 		Name string   `json:"name"`
 		Kind string   `json:"kind"`
 		CC   []string `json:"cc"`
+		BCC  []string `json:"bcc"`
 	}
 	if !decodeAPI(w, r, &in) {
 		return
@@ -142,7 +143,7 @@ func (a *App) apiCampaigns(w http.ResponseWriter, r *http.Request) {
 		problem(w, 400, "name and certificate or bulk kind required")
 		return
 	}
-	cc, err := normalizeCC("", in.CC)
+	cc, bcc, err := normalizeCopies("", in.CC, in.BCC)
 	if err != nil {
 		problem(w, 400, err.Error())
 		return
@@ -153,7 +154,7 @@ func (a *App) apiCampaigns(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := newID("cmp_")
-	_, e = a.DB.Exec(r.Context(), "INSERT INTO campaigns(id,application_id,name,kind,created_by,cc) VALUES($1,$2,$3,$4,$5,$6)", id, app, in.Name, in.Kind, actor, cc)
+	_, e = a.DB.Exec(r.Context(), "INSERT INTO campaigns(id,application_id,name,kind,created_by,cc,bcc) VALUES($1,$2,$3,$4,$5,$6,$7)", id, app, in.Name, in.Kind, actor, cc, bcc)
 	if e != nil {
 		problem(w, 500, "campaign could not be created")
 		return
@@ -494,7 +495,7 @@ func (a *App) apiWebhooks(w http.ResponseWriter, r *http.Request) {
 	respond(w, 200, map[string]any{"id": id})
 }
 
-var serviceScopes = []string{"message.send", "message.otp", "message.view", "message.cancel", "delivery.report", "template.view", "template.edit", "campaign.view", "campaign.edit", "campaign.approve", "campaign.send", "webhook.manage", "relay.manage"}
+var serviceScopes = []string{"message.send", "message.otp", "otp.create", "otp.verify", "message.view", "message.cancel", "delivery.report", "template.view", "template.edit", "campaign.view", "campaign.edit", "campaign.approve", "campaign.send", "webhook.manage", "relay.manage"}
 
 func (a *App) webhookView(ctx context.Context, app string) []map[string]any {
 	rows, _ := a.listWebhooks(ctx, app)

@@ -211,6 +211,8 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /settings", a.settings)
 	mux.HandleFunc("GET /audit", a.auditPage)
 	mux.HandleFunc("POST /v1/messages", a.apiSubmit)
+	mux.HandleFunc("POST /v1/otp/challenges", a.apiOTPCreate)
+	mux.HandleFunc("POST /v1/otp/challenges/{id}/verify", a.apiOTPVerify)
 	mux.HandleFunc("GET /v1/messages/{id}", a.apiMessage)
 	mux.HandleFunc("POST /v1/messages/{id}/cancel", a.apiCancel)
 	mux.HandleFunc("POST /v1/delivery-events", a.deliveryFeedback)
@@ -220,6 +222,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /templates/{id}/preview", a.previewTemplate)
 	mux.HandleFunc("POST /templates/{id}/archive", a.archiveTemplate)
 	mux.HandleFunc("GET /campaigns/{id}/export", a.campaignExport)
+	mux.HandleFunc("GET /campaigns/{id}/source", a.campaignSource)
 	mux.HandleFunc("GET /v1/templates", a.apiTemplates)
 	mux.HandleFunc("POST /v1/templates", a.apiTemplates)
 	mux.HandleFunc("GET /v1/templates/{id}", a.apiTemplate)
@@ -234,8 +237,10 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /v1/campaigns/{id}/import", a.apiCampaignImport)
 	mux.HandleFunc("POST /v1/campaigns/{id}/mapping", a.apiCampaignMapping)
 	mux.HandleFunc("POST /v1/campaigns/{id}/cc", a.apiCampaignCC)
+	mux.HandleFunc("POST /v1/campaigns/{id}/bcc", a.apiCampaignBCC)
 	mux.HandleFunc("GET /v1/campaigns/{id}/progress", a.apiCampaignProgress)
 	mux.HandleFunc("GET /v1/campaigns/{id}/export", a.campaignExport)
+	mux.HandleFunc("GET /v1/campaigns/{id}/source", a.campaignSource)
 	mux.HandleFunc("POST /v1/campaigns/{id}/{action}", a.apiCampaignAction)
 	mux.HandleFunc("GET /v1/me", func(w http.ResponseWriter, r *http.Request) {
 		p := person(r)
@@ -248,6 +253,7 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /v1/relays", a.apiRelays)
 	mux.HandleFunc("POST /v1/relays", a.apiRelays)
 	mux.HandleFunc("PUT /v1/relays/{id}", a.apiRelays)
+	mux.HandleFunc("DELETE /v1/relays/{id}", a.apiRelays)
 	mux.HandleFunc("POST /v1/relays/{id}/{operation}", a.apiRelays)
 	mux.HandleFunc("PUT /v1/relay-routing", a.apiRouting)
 	mux.HandleFunc("GET /v1/webhooks", a.apiWebhooks)
@@ -621,13 +627,17 @@ func (a *App) message(w http.ResponseWriter, r *http.Request) {
 }
 func (a *App) messagePreview(w http.ResponseWriter, r *http.Request) {
 	var scope, content string
-	e := a.DB.QueryRow(r.Context(), "SELECT application_id,html FROM messages WHERE id=$1", r.PathValue("id")).Scan(&scope, &content)
+	var encrypted bool
+	e := a.DB.QueryRow(r.Context(), "SELECT application_id,html,otp_encrypted FROM messages WHERE id=$1", r.PathValue("id")).Scan(&scope, &content, &encrypted)
 	if e != nil {
 		problem(w, 404, "message not found")
 		return
 	}
 	if !a.require(w, r, scope, "message.view") {
 		return
+	}
+	if encrypted {
+		content = "<p>Verification code content is hidden.</p>"
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	config, e := a.runtimeConfig(r.Context())

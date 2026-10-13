@@ -33,13 +33,21 @@ The expanded campaign/template API, Excel imports, image previews, webhooks, and
 - Statistics, charts, audit records, body-retention cleanup, authenticated Prometheus metrics, example alert rules, and backup/restore-check scripts.
 - Multiple named SMTP relays with exact sender-domain routes and mandatory sender-domain restriction; read-only PMG API tracking, opt-in once-only fallback after confirmed permanent IP reputation rejection, and gateway outcome ingestion with a durable Postfix-log adapter; `remote_accepted` means the recipient's server accepted transport, not inbox placement or reading.
 
-OTP generation/verification, certificate PDF generation, and file attachments remain outside this release scope. There is no MCP server; automation uses the service API. Certificate dispatch sends existing links. Exact duplicate recipient/school/event/award/link rows require exclusion or correction.
+Certificate PDF generation and file attachments remain outside this release scope. App-scoped email OTP generation and verification are available through the service API. There is no MCP server; automation uses the service API. Certificate dispatch sends existing links. Exact duplicate recipient/school/event/award/link rows require exclusion or correction.
 
 `v1.2.1` adds **Combine certificates** in certificate mapping: one email per recipient, school and event with a list of participant names, awards and links. Choose a combined template containing `{{certificate_list}}` and select the name columns (including all members for team certificates). Original source row references remain visible in review/API/export. Invalid and excluded rows remain separate; remapping preserves exclusions. Different campaigns, schools and events stay separate. Grouping is off by default and requires migration 010; existing installations and approved campaigns keep their original behavior. See [the API guide](api/guide.md#combine-certificates-into-fewer-emails) for automation and preview examples.
 
-`v1.3.0` adds optional **CC recipients** for transactional messages and campaigns, configured in the campaign dashboard or API. Approval freezes the list, and campaign test sends go only to the supplied test mailbox. CC addresses count towards daily recipient volume and per-recipient limits; the queue still stores one job per email. SMTP submits DATA only after every recipient is accepted. Remote delivery feedback tracks the primary To recipient; after gateway acceptance, messages with CC cannot automatically fall back on a To-only rejection because copies might already have arrived. Migration 011 preserves existing messages and campaigns with empty CC lists. BCC remains unsupported.
+`v1.3.0` adds optional **CC recipients** for transactional messages and campaigns, configured in the campaign dashboard or API. Approval freezes the list, and campaign test sends go only to the supplied test mailbox. CC addresses count towards daily recipient volume and per-recipient limits; the queue still stores one job per email. SMTP submits DATA only after every recipient is accepted. Remote delivery feedback tracks the primary To recipient; after gateway acceptance, messages with CC cannot automatically fall back on a To-only rejection because copies might already have arrived. Migration 011 preserves existing messages and campaigns with empty CC lists.
 
 `v1.3.0` also adds a sender display name in application settings (including Thai), stored with each queued email. Changing it affects future admissions; existing jobs keep their original name. Reply-To and email-body logos/signatures remain independent. Optional **Inbox branding** guidance and DNS checks inspect DMARC (including organizational-domain inheritance) and the default BIMI selector. These checks do not fetch logos/certificates, validate certificate contents or guarantee a provider avatar/badge. Gmail requires a VMC/CMC for BIMI; its checkmark requires a VMC. See [Google's setup guide](https://support.google.com/a/answer/10911320).
+
+`v1.4.0` adds app-scoped email OTP generation/verification and **BCC recipients**. CC and BCC share a combined limit of 20 unique copies; BCC stays out of email headers. Approval freezes both lists, and campaign test sends omit both.
+
+Named relays can be deleted in SMTP settings or with `DELETE /v1/relays/{id}` (`relay.manage`) after removing routes and fallback references. Relays referenced by message history must be retained and can be disabled. Completed campaigns display saved configuration and frozen row template versions. Bulk mappings saved before this feature are unavailable; new mappings are persisted. **Download source CSV** exports the normalized import snapshot, including excluded/skipped rows; JSON download preserves exact snapshot values. Original workbook bytes are not retained. The API exposes `GET /v1/campaigns/{id}/source?format=csv` or `json` with `campaign.view`. Migration 014 adds empty BCC lists to existing messages and campaigns; replace all web and worker instances before enabling BCC.
+
+### Upgrade to v1.4.0
+
+Run migrations 014–015 and replace all web and worker instances before using BCC or the generated OTP API. Existing messages retain empty BCC and an unencrypted-content flag; existing caller-supplied OTP delivery is preserved. Keep the same `SECRET_KEY`. Existing service keys need explicitly granted `otp.create` and/or `otp.verify` scopes.
 
 ### Upgrade to v1.3.0
 
@@ -102,6 +110,8 @@ The server returns `202` only after the message and queue job are committed. The
 | Endpoint | Scope |
 | --- | --- |
 | `POST /v1/messages` | `message.send`; `message.otp` additionally required for OTP priority |
+| `POST /v1/otp/challenges` | `otp.create` |
+| `POST /v1/otp/challenges/{id}/verify` | `otp.verify` |
 | `GET /v1/messages/{id}` | `message.view` |
 | `POST /v1/messages/{id}/cancel` | `message.cancel` |
 | `POST /v1/delivery-events` | `delivery.report` (platform-admin-issued) |
@@ -113,9 +123,9 @@ The server returns `202` only after the message and queue job are committed. The
 | `POST /v1/campaigns/{id}/approve` | `campaign.approve` |
 | Campaign start/pause/resume/cancel actions | `campaign.send` |
 | `GET/POST /v1/webhooks`, `PUT /v1/webhooks/{id}` | `webhook.manage` |
-| `GET/POST /v1/relays`, update/test relays, `PUT /v1/relay-routing` | `relay.manage` (global; platform-admin-issued) |
+| `GET/POST /v1/relays`, update/test/delete relays, `PUT /v1/relay-routing` | `relay.manage` (global; platform-admin-issued) |
 
-Message fields: `to`, `template` (slug or ID), optional `template_version`, string-valued `variables`, optional `class` (`transactional` or `otp`), `schedule_at`, and `expires_at` (RFC3339). OTP expiry cannot exceed five minutes. Bulk messages require an approved campaign, prepared through the dashboard or campaign API. `429` means admission was rejected and no message was queued; `Retry-After` is supplied. Quotas are measured over rolling 24-hour and one-hour windows. Bulk campaigns reserve 20% of queue capacity and 10% of daily quota for transactional traffic. One of every five dispatch opportunities favors bulk to avoid starvation while OTP and transactional messages receive the others.
+Message fields: `to`, `template` (slug or ID), optional `cc` and `bcc` arrays, optional `template_version`, string-valued `variables`, optional `class` (`transactional` or `otp`), `schedule_at`, and `expires_at` (RFC3339). OTP expiry cannot exceed five minutes. Bulk messages require an approved campaign, prepared through the dashboard or campaign API. `429` means admission was rejected and no message was queued; `Retry-After` is supplied. Quotas are measured over rolling 24-hour and one-hour windows. Bulk campaigns reserve 20% of queue capacity and 10% of daily quota for transactional traffic. One of every five dispatch opportunities favors bulk to avoid starvation while OTP and transactional messages receive the others.
 
 The authenticated API reference is at `/docs` (self-hosted Scalar). `/openapi.yaml` serves the exact bundled contract, `/llms.txt` is a machine-readable index, and `/llms-full.txt` is an integration guide. All four require an active EDP login session or a valid service key sent as `Authorization: Bearer ...`; anonymous visitors are redirected to login, and invalid/revoked keys receive 401. Documentation responses are not cached. Scalar uses local assets, disables hosted Agent/telemetry/proxy integrations, and does not persist API credentials in browser storage. See [the integration guide](api/guide.md) for machine clients.
 
@@ -205,7 +215,7 @@ A trusted gateway integration can submit:
 Copy `.env.production.example` to `.env.production`, set a real PostgreSQL connection, `PUBLIC_URL`, a stable 32-byte base64 `SECRET_KEY`, root bootstrap credentials. Configure named SMTP relays and sender-domain routes after root login. Configure PMG and OIDC through Settings or bootstrap environment values. Put HTTPS termination in front of the localhost-bound web port. Development defaults are not used by `compose.production.yaml`.
 
 ```sh
-EDP_IMAGE=ghcr.io/mwit-msc/email-delivery-platform:v1.2.1 \
+EDP_IMAGE=ghcr.io/mwit-msc/email-delivery-platform:v1.4.0 \
   docker compose -f compose.production.yaml up -d
 ```
 
@@ -244,3 +254,13 @@ Integration tests use an isolated temporary schema in `EDP_TEST_DATABASE_URL` an
 The core supports generic OIDC providers, configurable labels/group claims, arbitrary bulk template variables, SMTP relays, and optional PMG tracking. Organization-specific certificate content and logos are optional local inputs, excluded from the repository and release image. Set `SEED_CERTIFICATES_FILE`/`SEED_LOGO_FILE` only for a deployment that owns those assets.
 
 EDP is available under the [MIT license](LICENSE). `third_party/` and bundled font OFL files contain dependency licenses; these are also copied into the image under `/usr/share/licenses/edp/`.
+
+## Email OTP for other applications
+
+Create service keys with `otp.create` and/or `otp.verify` in the application’s credentials page. Developers and application administrators can grant these scopes. Existing keys do not gain them automatically. These APIs are for your backend; keep service keys out of browser/mobile clients. `POST /v1/otp/challenges` with `Idempotency-Key` and `{"to":"person@example.test","purpose":"login"}` atomically commits a challenge and one OTP-priority delivery job. The response returns `id`, `message_id`, `expires_at`, and `replayed`; it never returns the code. The fixed email contains a six-digit code with five-minute expiry. Leading zeroes matter. No template setup, CC or BCC is supported by this API.
+
+`POST /v1/otp/challenges/{id}/verify` with `{"purpose":"login","code":"012345"}` returns `{"verified":true,"to":"person@example.test","purpose":"login"}` once. Your app must bind the challenge ID to its expected mailbox and purpose before creating any session or changing account state. Incorrect guesses or purposes count toward a maximum of five failed attempts. All invalid, expired, consumed, exhausted, revoked, unknown and foreign challenges return `{"verified":false}`. Verification is atomic across processes. EDP does not create a user account or login session for the caller.
+
+Requests to the same recipient share a 60-second resend cooldown per application, across purposes. Reuse the creation idempotency key only to retry the same request; it returns the original challenge without sending again or extending expiry. To resend after the cooldown, use a new key. A resend for the same purpose revokes the prior challenge and cancels pending mail; an email already submitted may still arrive, but its old challenge cannot verify. A rejected replacement leaves the prior challenge intact. Normal recipient quotas, queue bounds, suspension and named-relay routing apply.
+
+Migration 015 adds challenges and an encrypted-content flag with safe defaults for existing mail. Update all web and worker instances before using the new API. Generated codes use an HMAC verifier; queued HTML/plain text is encrypted with the stable deployment key, and dashboard previews always hide it. Consumed, exhausted and superseded bodies are erased; worker-owned rows are cleared during the next maintenance cycle. The worker clears expired verifier/body data during its 30-second maintenance cycle. Challenge/message metadata remains for idempotency and delivery history. Existing caller-supplied `class:otp` message behavior is preserved. The message idempotency prefix `edp:otp:` is reserved for generated challenge jobs.

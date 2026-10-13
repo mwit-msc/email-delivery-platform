@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Email Delivery Platform
-  version: 1.3.0
+  version: 1.4.0
   description: Application-scoped bearer API for durable delivery, templates, campaigns, assets, and webhooks.
     relay.manage is a privileged platform-wide permission. Expanded API operations reject unknown JSON
     fields and multiple JSON values.
@@ -25,6 +25,8 @@ components:
           format: email
         cc:
           $ref: '#/components/schemas/CCRecipients'
+        bcc:
+          $ref: '#/components/schemas/BCCRecipients'
         template:
           type: string
         template_version:
@@ -58,7 +60,24 @@ components:
         format: email
       description: Bare CC mailbox addresses. Whitespace and domain casing are normalized;
         duplicates and the To recipient are removed. Copies consume daily recipient quota
-        and recipient cooldown limits. BCC is not supported.
+        and recipient cooldown limits. CC and BCC together allow at most 20 unique copies;
+        duplicates across lists are kept in CC.
+    BCCRecipients:
+      type: array
+      maxItems: 20
+      items:
+        type: string
+        format: email
+      description: Bare blind-copy mailboxes, hidden from MIME headers. Whitespace and domain casing
+        are normalized; duplicates of To or CC are removed. Copies consume daily quota and
+        recipient cooldown limits. CC and BCC together allow at most 20 unique copies.
+    CampaignBCC:
+      type: object
+      properties:
+        bcc:
+          $ref: '#/components/schemas/BCCRecipients'
+      required: [bcc]
+      additionalProperties: false
     CampaignCC:
       type: object
       properties:
@@ -66,6 +85,63 @@ components:
           $ref: '#/components/schemas/CCRecipients'
       required: [cc]
       additionalProperties: false
+    OTPCreate:
+      type: object
+      additionalProperties: false
+      required: [to, purpose]
+      properties:
+        to:
+          type: string
+          format: email
+          description: Single bare mailbox; no CC or BCC. Domain casing and surrounding whitespace are normalized.
+        purpose:
+          type: string
+          maxLength: 64
+          pattern: '^[a-z][a-z0-9._-]{0,63}$'
+          description: Intent such as login or verify_email. Creation normalizes surrounding whitespace and casing.
+    OTPChallenge:
+      type: object
+      required: [id, message_id, expires_at, replayed]
+      additionalProperties: false
+      properties:
+        id:
+          type: string
+        message_id:
+          type: string
+        expires_at:
+          type: string
+          format: date-time
+        replayed:
+          type: boolean
+    OTPVerify:
+      type: object
+      additionalProperties: false
+      required: [purpose, code]
+      properties:
+        purpose:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: Exact normalized purpose from creation; mismatch consumes a failed attempt.
+        code:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: The six-digit string received by email; preserve leading zeroes. Incorrect values consume an attempt.
+    OTPVerification:
+      type: object
+      additionalProperties: false
+      required: [verified]
+      properties:
+        verified:
+          type: boolean
+        to:
+          type: string
+          format: email
+          description: Present only on success. Match against the mailbox expected by your application.
+        purpose:
+          type: string
+          description: Present only on success.
     Error:
       type: object
       properties:
@@ -285,6 +361,8 @@ components:
           default: certificate
         cc:
           $ref: '#/components/schemas/CCRecipients'
+        bcc:
+          $ref: '#/components/schemas/BCCRecipients'
       additionalProperties: false
       required:
       - name
@@ -503,6 +581,88 @@ components:
           schema:
             $ref: '#/components/schemas/Error'
 paths:
+  /v1/otp/challenges:
+    post:
+      operationId: createOTPChallenge
+      summary: Generate and email a single-use verification code
+      description: Requires otp.create. Sends a fixed verification email through normal application
+        routing, quotas and OTP-priority delivery. The six-digit code expires five minutes after creation
+        and allows five failed guesses. No code is returned. Requests to the same mailbox in an application
+        share a 60-second cooldown across purposes. A new request for the same mailbox and purpose revokes
+        the old challenge atomically with admission; admission failure preserves the old challenge.
+        Idempotent replay preserves the original expiry and verification state and does not resend.
+        Codes must be verified by an application server; do not expose service keys in browsers.
+      parameters:
+      - in: header
+        name: Idempotency-Key
+        required: true
+        schema:
+          type: string
+          minLength: 1
+          maxLength: 200
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OTPCreate'
+      responses:
+        '202':
+          description: Challenge and delivery job committed, or idempotent replay. Email delivery is asynchronous.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OTPChallenge'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: Idempotency payload conflict or application paused.
+        '429':
+          description: Recipient cooldown, daily recipient quota or queue capacity reached. No challenge admitted.
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+        '503':
+          description: Platform sending paused.
+  /v1/otp/challenges/{id}/verify:
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        type: string
+    post:
+      operationId: verifyOTPChallenge
+      summary: Verify and atomically consume an app-scoped email code
+      description: Requires otp.verify. A challenge can succeed only once, even across concurrent
+        requests. Incorrect codes or purposes consume one of five attempts. Expired, revoked, consumed,
+        exhausted, unknown and foreign-application challenges all return verified false without recipient
+        metadata. A successful response returns the verified mailbox and purpose, not a login session.
+        Keep the challenge ID tied to the expected mailbox/purpose in your application; it is not an identity.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OTPVerify'
+      responses:
+        '200':
+          description: Verification result. On success the code is consumed and cannot be replayed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OTPVerification'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
   /v1/messages:
     post:
       operationId: submitMessage
@@ -1127,13 +1287,50 @@ paths:
       summary: Set or clear the CC list on a draft campaign
       description: Requires campaign.edit. Approval freezes copies. An approved but unsent
         campaign must return to draft before editing and be approved again. Saving CC does
-        not queue mail. Test sends intentionally omit campaign CC and go only to the test address.
+        not queue mail. Test sends intentionally omit campaign CC and BCC and go only to the test address.
       requestBody:
         required: true
         content:
           application/json:
             schema:
               $ref: '#/components/schemas/CampaignCC'
+      responses:
+        '200':
+          description: Saved; no message queued.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  saved:
+                    type: boolean
+        '400':
+          description: Invalid addresses, missing array, or campaign is not draft.
+        '401':
+          description: Invalid or missing authentication.
+        '403':
+          description: Insufficient permission.
+        '404':
+          description: Campaign absent in this application.
+  /v1/campaigns/{id}/bcc:
+    parameters:
+    - name: id
+      in: path
+      required: true
+      schema:
+        type: string
+    post:
+      operationId: setCampaignBCC
+      summary: Set or clear the BCC list on a draft campaign
+      description: Requires campaign.edit. Approval freezes copies. An approved but unsent
+        campaign must return to draft before editing and be approved again. Saving BCC does
+        not queue mail. Test sends intentionally omit campaign BCC and go only to the test address.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CampaignBCC'
       responses:
         '200':
           description: Saved; no message queued.
@@ -1273,6 +1470,51 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+  /v1/campaigns/{id}/source:
+    parameters:
+    - in: path
+      name: id
+      required: true
+      schema:
+        type: string
+    get:
+      operationId: downloadCampaignSource
+      summary: Download the normalized recipient import snapshot
+      description: Requires campaign.view. Includes headers and all imported rows, including excluded
+        and skipped rows. Original workbook bytes are not retained. CSV uses UTF-8 with BOM and
+        protects formula-leading cells; JSON preserves snapshot cell strings exactly. Available in all campaign states.
+      parameters:
+      - in: query
+        name: format
+        schema:
+          type: string
+          enum: [csv, json]
+          default: csv
+      responses:
+        '200':
+          description: Stored source snapshot
+          content:
+            text/csv:
+              schema:
+                type: string
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rows:
+                    type: array
+                    items:
+                      type: array
+                      items:
+                        type: string
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Campaign or imported snapshot unavailable.
   /v1/webhooks:
     get:
       operationId: listWebhooks
@@ -1457,6 +1699,23 @@ paths:
           application/json:
             schema:
               $ref: '#/components/schemas/RelayInput'
+    delete:
+      operationId: deleteRelay
+      summary: Delete an unreferenced named SMTP relay
+      description: Requires relay.manage (privileged platform-wide). Remove sender-domain routes and
+        fallback references first. A relay referenced by any message, including delivery history,
+        must be retained and can be disabled instead. Reference checks and deletion are transactional.
+      responses:
+        '204':
+          description: Relay deleted.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Relay not found.
+        '409':
+          description: Relay is still referenced.
   /v1/relays/{id}/test:
     parameters:
     - in: path

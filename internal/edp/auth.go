@@ -58,10 +58,10 @@ func checkPassword(encoded, pw string) bool {
 
 var roles = map[string][]string{
 	"viewer":         {"app.view", "message.view", "template.view", "campaign.view", "stats.view"},
-	"developer":      {"app.view", "message.view", "message.send", "template.view", "template.edit", "key.manage", "campaign.view", "stats.view"},
+	"developer":      {"app.view", "message.view", "message.send", "otp.create", "otp.verify", "template.view", "template.edit", "key.manage", "campaign.view", "stats.view"},
 	"operator":       {"app.view", "message.view", "template.view", "campaign.view", "campaign.edit", "campaign.send", "stats.view"},
 	"approver":       {"app.view", "message.view", "template.view", "campaign.view", "campaign.approve", "stats.view"},
-	"admin":          {"app.view", "app.manage", "message.view", "message.send", "message.cancel", "template.view", "template.edit", "key.manage", "campaign.view", "campaign.edit", "campaign.approve", "campaign.send", "stats.view", "member.manage", "webhook.manage"},
+	"admin":          {"app.view", "app.manage", "message.view", "message.send", "otp.create", "otp.verify", "message.cancel", "template.view", "template.edit", "key.manage", "campaign.view", "campaign.edit", "campaign.approve", "campaign.send", "stats.view", "member.manage", "webhook.manage"},
 	"platform_admin": {"*"},
 }
 

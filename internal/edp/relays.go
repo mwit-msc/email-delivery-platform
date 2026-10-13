@@ -188,6 +188,37 @@ func (a *App) listRelays(ctx context.Context) ([]map[string]any, error) {
 	}
 	return result, rows.Err()
 }
+
+// Keep references intact: queued jobs and delivery history identify their relay.
+func (a *App) deleteRelay(ctx context.Context, id string) error {
+	tx, err := a.DB.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock(824193)"); err != nil {
+		return err
+	}
+	var name string
+	if err = tx.QueryRow(ctx, "SELECT name FROM smtp_relays WHERE id=$1 FOR UPDATE", id).Scan(&name); err != nil {
+		return err
+	}
+	var routes, fallbacks, messages int
+	err = tx.QueryRow(ctx, `SELECT
+		(SELECT count(*) FROM sender_domain_routes WHERE relay_id=$1),
+		(SELECT count(*) FROM smtp_relays WHERE fallback_id=$1),
+		(SELECT count(*) FROM messages WHERE relay_id=$1 OR fallback_relay_id=$1)`, id).Scan(&routes, &fallbacks, &messages)
+	if err != nil {
+		return err
+	}
+	if routes+fallbacks+messages > 0 {
+		return fmt.Errorf("relay is referenced by %d sender-domain routes, %d fallback links and %d messages; remove routes and fallback links first. Relays in delivery history must be retained; disable them instead", routes, fallbacks, messages)
+	}
+	if _, err = tx.Exec(ctx, "DELETE FROM smtp_relays WHERE id=$1", id); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
 func (a *App) setDomainRoute(ctx context.Context, domain, relayID string) error {
 	domain, e := relayDomain(domain)
 	if e != nil {

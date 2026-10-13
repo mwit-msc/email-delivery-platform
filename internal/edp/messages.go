@@ -94,6 +94,7 @@ type SendInput struct {
 	ApplicationID string            `json:"application_id"`
 	To            string            `json:"to"`
 	CC            []string          `json:"cc,omitempty"`
+	BCC           []string          `json:"bcc,omitempty"`
 	Template      string            `json:"template"`
 	Version       int               `json:"template_version"`
 	Variables     map[string]string `json:"variables"`
@@ -154,17 +155,38 @@ type HTTPError struct {
 
 func (e *HTTPError) Error() string { return e.Message }
 func (a *App) Submit(ctx context.Context, in SendInput, key string) (string, bool, error) {
+	if strings.HasPrefix(key, "edp:otp:") {
+		return "", false, &HTTPError{400, "idempotency prefix edp:otp: is reserved"}
+	}
+	tx, err := a.DB.Begin(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	defer tx.Rollback(ctx)
+	id, replayed, err := a.submitWith(ctx, tx, in, key, nil)
+	if err != nil {
+		return "", false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", false, err
+	}
+	return id, replayed, nil
+}
+
+// Shared admission keeps challenge and delivery commits atomic without bypassing
+// sender routing, recipient limits, durable idempotency or queue capacity.
+func (a *App) submitWith(ctx context.Context, tx pgx.Tx, in SendInput, key string, generated *Rendered) (string, bool, error) {
 	if len(key) < 1 || len(key) > 200 {
 		return "", false, &HTTPError{400, "Idempotency-Key is required (maximum 200 characters)"}
 	}
 	if !validAddress(in.To) {
 		return "", false, &HTTPError{400, "invalid recipient address"}
 	}
-	cc, err := normalizeCC(in.To, in.CC)
+	cc, bcc, err := normalizeCopies(in.To, in.CC, in.BCC)
 	if err != nil {
 		return "", false, &HTTPError{400, err.Error()}
 	}
-	in.CC = cc
+	in.CC, in.BCC = cc, bcc
 	if in.Class == "" {
 		in.Class = "transactional"
 	}
@@ -173,11 +195,7 @@ func (a *App) Submit(ctx context.Context, in SendInput, key string) (string, boo
 	}
 	data, _ := json.Marshal(in)
 	fingerprint := tokenHash(string(data))
-	tx, e := a.DB.Begin(ctx)
-	if e != nil {
-		return "", false, e
-	}
-	defer tx.Rollback(ctx)
+	var e error
 	var paused bool
 	var from, reply, fromName string
 	var daily, recipientLimit, queueLimit int
@@ -207,55 +225,67 @@ func (a *App) Submit(ctx context.Context, in SendInput, key string) (string, boo
 		return "", false, &HTTPError{503, "sending is paused by the platform"}
 	}
 	var dayCount, queued int
-	e = tx.QueryRow(ctx, `SELECT coalesce(sum(1+cardinality(cc)) FILTER(WHERE created_at>=now()-interval '24 hours'),0),count(*) FILTER(WHERE status IN('queued','retry_wait','sending')) FROM messages WHERE application_id=$1`, in.ApplicationID).Scan(&dayCount, &queued)
+	e = tx.QueryRow(ctx, `SELECT coalesce(sum(1+cardinality(cc)+cardinality(bcc)) FILTER(WHERE created_at>=now()-interval '24 hours'),0),count(*) FILTER(WHERE status IN('queued','retry_wait','sending')) FROM messages WHERE application_id=$1`, in.ApplicationID).Scan(&dayCount, &queued)
 	if e != nil {
 		return "", false, e
 	}
-	if dayCount+1+len(cc) > daily || queued >= queueLimit {
+	if dayCount+1+len(cc)+len(bcc) > daily || queued >= queueLimit {
 		return "", false, &HTTPError{429, "application quota, recipient cooldown, or queue capacity reached"}
 	}
 	additions := map[string]int{strings.ToLower(in.To): 1}
-	for _, address := range cc {
+	for _, address := range append(append([]string{}, cc...), bcc...) {
 		additions[strings.ToLower(address)]++
 	}
 	if err := checkRecipientCapacity(ctx, tx, in.ApplicationID, additions, recipientLimit); err != nil {
 		return "", false, &HTTPError{429, err.Error()}
 	}
-	expires := time.Now().Add(24 * time.Hour)
+	admissionNow := time.Now()
+	if generated != nil {
+		// Generated challenges use database time for their fixed lifetime.
+		// Web/database host clock skew must not reject a valid internal OTP.
+		if e = tx.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&admissionNow); e != nil {
+			return "", false, e
+		}
+	}
+	expires := admissionNow.Add(24 * time.Hour)
 	if in.Class == "otp" {
-		expires = time.Now().Add(5 * time.Minute)
+		expires = admissionNow.Add(5 * time.Minute)
 	}
 	if in.ExpiresAt != nil {
 		expires = *in.ExpiresAt
 	}
-	scheduled := time.Now()
+	scheduled := admissionNow
 	if in.ScheduleAt != nil {
 		scheduled = *in.ScheduleAt
 	}
-	if in.Class == "otp" && expires.After(time.Now().Add(5*time.Minute)) {
+	if in.Class == "otp" && expires.After(admissionNow.Add(5*time.Minute)) {
 		return "", false, &HTTPError{400, "OTP expiry cannot exceed five minutes"}
 	}
-	if expires.Before(scheduled) || expires.After(time.Now().Add(30*24*time.Hour)) {
+	if expires.Before(scheduled) || expires.After(admissionNow.Add(30*24*time.Hour)) {
 		return "", false, &HTTPError{400, "expiry must follow scheduling and be within 30 days"}
 	}
-	rendered, e := renderMessageWith(ctx, tx, in.ApplicationID, in.Template, in.Version, in.Variables)
-	if e != nil {
-		return "", false, &HTTPError{400, e.Error()}
+	var rendered Rendered
+	if generated != nil {
+		rendered = *generated
+		rendered.HTML = seal(a.C.Secret, rendered.HTML)
+		rendered.Plain = seal(a.C.Secret, rendered.Plain)
+	} else {
+		rendered, e = renderMessageWith(ctx, tx, in.ApplicationID, in.Template, in.Version, in.Variables)
+		if e != nil {
+			return "", false, &HTTPError{400, e.Error()}
+		}
 	}
 	relayID, relayError := senderRelayWith(ctx, tx, from)
 	if relayError != nil {
 		return "", false, &HTTPError{400, relayError.Error()}
 	}
 	id := newID("msg_")
-	_, e = tx.Exec(ctx, `INSERT INTO messages(id,application_id,recipient,from_address,reply_to,subject,html,plain,class,idempotency_key,payload_hash,available_at,expires_at,relay_id,cc,from_name) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NULLIF($14,''),$15,$16)`, id, in.ApplicationID, in.To, from, reply, rendered.Subject, rendered.HTML, rendered.Plain, in.Class, key, fingerprint, scheduled, expires, relayID, cc, fromName)
+	_, e = tx.Exec(ctx, `INSERT INTO messages(id,application_id,recipient,from_address,reply_to,subject,html,plain,class,idempotency_key,payload_hash,available_at,expires_at,relay_id,cc,from_name,bcc,otp_encrypted) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,NULLIF($14,''),$15,$16,$17,$18)`, id, in.ApplicationID, in.To, from, reply, rendered.Subject, rendered.HTML, rendered.Plain, in.Class, key, fingerprint, scheduled, expires, relayID, cc, fromName, bcc, generated != nil)
 	if e != nil {
 		return "", false, e
 	}
 	_, e = tx.Exec(ctx, "INSERT INTO delivery_events(message_id,status) VALUES($1,'queued')", id)
 	if e != nil {
-		return "", false, e
-	}
-	if e = tx.Commit(ctx); e != nil {
 		return "", false, e
 	}
 	return id, false, nil

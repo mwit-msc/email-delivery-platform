@@ -453,8 +453,8 @@ func (a *App) startCampaign(ctx context.Context, id string, scheduled time.Time)
 	}
 	defer tx.Rollback(ctx)
 	var app, state string
-	var campaignCC []string
-	e = tx.QueryRow(ctx, "SELECT application_id,state,cc FROM campaigns WHERE id=$1 FOR UPDATE", id).Scan(&app, &state, &campaignCC)
+	var campaignCC, campaignBCC []string
+	e = tx.QueryRow(ctx, "SELECT application_id,state,cc,bcc FROM campaigns WHERE id=$1 FOR UPDATE", id).Scan(&app, &state, &campaignCC, &campaignBCC)
 	if e != nil {
 		return e
 	}
@@ -479,7 +479,7 @@ func (a *App) startCampaign(ctx context.Context, id string, scheduled time.Time)
 	if e = tx.QueryRow(ctx, "SELECT count(*) FROM campaign_rows WHERE campaign_id=$1 AND NOT excluded", id).Scan(&count); e != nil {
 		return e
 	}
-	if e = tx.QueryRow(ctx, "SELECT coalesce(sum(1+cardinality(cc)) FILTER(WHERE created_at>=now()-interval '24 hours'),0),count(*) FILTER(WHERE status IN('queued','retry_wait','sending')) FROM messages WHERE application_id=$1", app).Scan(&used, &queued); e != nil {
+	if e = tx.QueryRow(ctx, "SELECT coalesce(sum(1+cardinality(cc)+cardinality(bcc)) FILTER(WHERE created_at>=now()-interval '24 hours'),0),count(*) FILTER(WHERE status IN('queued','retry_wait','sending')) FROM messages WHERE application_id=$1", app).Scan(&used, &queued); e != nil {
 		return e
 	}
 	if count+queued > queueLimit*8/10 {
@@ -499,7 +499,7 @@ func (a *App) startCampaign(ctx context.Context, id string, scheduled time.Time)
 		To, Template, Key string
 		Version           int
 		Vars              map[string]string
-		CC                []string
+		CC, BCC           []string
 	}
 	var items []item
 	for rows.Next() {
@@ -524,17 +524,17 @@ func (a *App) startCampaign(ctx context.Context, id string, scheduled time.Time)
 	deliveries := 0
 	for index := range items {
 		i := &items[index]
-		if i.CC, e = normalizeCC(i.To, campaignCC); e != nil {
+		if i.CC, i.BCC, e = normalizeCopies(i.To, campaignCC, campaignBCC); e != nil {
 			return e
 		}
-		deliveries += 1 + len(i.CC)
+		deliveries += 1 + len(i.CC) + len(i.BCC)
 		additions[strings.ToLower(i.To)]++
-		for _, address := range i.CC {
+		for _, address := range append(append([]string{}, i.CC...), i.BCC...) {
 			additions[strings.ToLower(address)]++
 		}
 	}
 	if deliveries+used > daily*9/10 {
-		return fmt.Errorf("campaign exceeds daily recipient quota (including CC); transactional capacity is reserved")
+		return fmt.Errorf("campaign exceeds daily recipient quota (including CC and BCC); transactional capacity is reserved")
 	}
 	if e = checkRecipientCapacity(ctx, tx, app, additions, recipientLimit); e != nil {
 		return e
@@ -549,7 +549,7 @@ func (a *App) startCampaign(ctx context.Context, id string, scheduled time.Time)
 			return e
 		}
 		mid := newID("msg_")
-		_, e = tx.Exec(ctx, `INSERT INTO messages(id,application_id,campaign_id,recipient,from_address,reply_to,subject,html,plain,class,idempotency_key,payload_hash,available_at,expires_at,relay_id,cc,from_name) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'bulk',$10,$11,$12,$13,NULLIF($14,''),$15,$16)`, mid, app, id, i.To, from, reply, rendered.Subject, rendered.HTML, rendered.Plain, "campaign:"+id+":"+i.Key, i.Key, scheduled, scheduled.Add(7*24*time.Hour), relayID, i.CC, fromName)
+		_, e = tx.Exec(ctx, `INSERT INTO messages(id,application_id,campaign_id,recipient,from_address,reply_to,subject,html,plain,class,idempotency_key,payload_hash,available_at,expires_at,relay_id,cc,from_name,bcc) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'bulk',$10,$11,$12,$13,NULLIF($14,''),$15,$16,$17)`, mid, app, id, i.To, from, reply, rendered.Subject, rendered.HTML, rendered.Plain, "campaign:"+id+":"+i.Key, i.Key, scheduled, scheduled.Add(7*24*time.Hour), relayID, i.CC, fromName, i.BCC)
 		if e != nil {
 			return e
 		}
@@ -629,6 +629,8 @@ func (a *App) campaign(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "POST" {
 		action := r.FormValue("action")
 		switch action {
+		case "bcc":
+			e = a.setCampaignBCC(r.Context(), id, parseCC(r.FormValue("bcc")))
 		case "cc":
 			e = a.setCampaignCC(r.Context(), id, parseCC(r.FormValue("cc")))
 		case "import":
@@ -808,7 +810,8 @@ func (a *App) campaign(w http.ResponseWriter, r *http.Request) {
 			ruleVariables[rule.Award] = string(raw)
 		}
 	}
-	a.render(w, r, "campaign", map[string]any{"Campaign": data, "Rows": rows, "Headers": headers, "Awards": sourceAwards(source), "Mapping": mapping, "NameColumns": nameColumns, "CertificateCount": certificates, "RuleSelections": ruleSelections, "RuleVariables": ruleVariables, "Scope": scope, "SheetConfigured": a.C.GoogleCredentials != "", "Templates": templates, "SelectedTemplate": selected, "TemplateVariables": variables})
+	fields, mappingJSON := campaignMappingReview(data["kind"].(string), data["mapping"], headers)
+	a.render(w, r, "campaign", map[string]any{"MappingFields": fields, "MappingJSON": mappingJSON, "Campaign": data, "Rows": rows, "Headers": headers, "Awards": sourceAwards(source), "Mapping": mapping, "NameColumns": nameColumns, "CertificateCount": certificates, "RuleSelections": ruleSelections, "RuleVariables": ruleVariables, "Scope": scope, "SheetConfigured": a.C.GoogleCredentials != "", "Templates": templates, "SelectedTemplate": selected, "TemplateVariables": variables})
 }
 func (a *App) campaignPreview(w http.ResponseWriter, r *http.Request) {
 	var scope, tid string
@@ -984,6 +987,13 @@ func (a *App) mapBulkCampaign(ctx context.Context, id, templateID string, emailC
 		if e != nil {
 			return e
 		}
+	}
+	mapping, e := json.Marshal(BulkMapping{Template: templateID, Email: emailColumn, Columns: columns, Constants: constants})
+	if e != nil {
+		return e
+	}
+	if _, e = tx.Exec(ctx, "UPDATE campaigns SET mapping=$2 WHERE id=$1", id, mapping); e != nil {
+		return e
 	}
 	return tx.Commit(ctx)
 }
