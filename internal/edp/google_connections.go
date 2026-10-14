@@ -311,7 +311,9 @@ func (s googleUserTokens) Token() (*oauth2.Token, error) {
 	if err != nil {
 		return nil, fmt.Errorf("the Google account that started this scan is disconnected; reconnect and rescan")
 	}
-	c, err := s.app.runtimeConfig(s.ctx)
+	// Reuse the locked transaction; a second pool checkout can starve
+	// when concurrent refreshes occupy every available connection.
+	c, err := readRuntimeConfig(s.ctx, tx, s.app.C)
 	if err != nil || !c.googleEnabled() || hash != googleConfigHash(c) {
 		return nil, fmt.Errorf("Google application settings changed; reconnect and rescan")
 	}

@@ -17,6 +17,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type googleTestTransport func(*http.Request) (*http.Response, error)
@@ -108,6 +110,20 @@ func TestGoogleApplicationAndPersonalPermissions(t *testing.T) {
 func TestGooglePersonalConsentAndRefresh(t *testing.T) {
 	a := testApp(t)
 	ctx := context.Background()
+	// A single connection exposes nested pool acquisition deterministically.
+	// Refresh must read runtime settings through its existing transaction.
+	poolConfig, err := pgxpool.ParseConfig(a.C.DatabaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	poolConfig.MaxConns = 1
+	limited, err := pgxpool.NewWithConfig(ctx, poolConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.DB.Close()
+	a.DB = limited
+
 	user := runtimeTestSession(t, a, false)
 	second := runtimeTestSession(t, a, false)
 	a.C.GoogleClientID = "synthetic-client"
@@ -242,17 +258,24 @@ func TestGooglePersonalConsentAndRefresh(t *testing.T) {
 	}
 	a.DB.Exec(ctx, "UPDATE google_connections SET token_expiry=now()-interval '1 minute' WHERE user_id=$1", uid)
 	var wg sync.WaitGroup
+	tokenCtx, cancelTokens := context.WithTimeout(ctx, 5*time.Second)
+	defer cancelTokens()
+	var tokenFailed atomic.Bool
 	for range 4 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			tok, err := (googleUserTokens{a, ctx, uid, connection}).Token()
+			tok, err := (googleUserTokens{a, tokenCtx, uid, connection}).Token()
 			if err != nil || tok.AccessToken != "rotated-access" {
+				tokenFailed.Store(true)
 				t.Error("refresh", err)
 			}
 		}()
 	}
 	wg.Wait()
+	if tokenFailed.Load() {
+		t.Fatal("concurrent token refresh failed with a single-connection pool")
+	}
 	if refreshCalls.Load() != 1 {
 		t.Fatal("refresh was not serialized", refreshCalls.Load())
 	}
