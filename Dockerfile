@@ -8,11 +8,13 @@ ARG VERSION=development
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags="-s -w -X main.version=$VERSION" -o /edp ./cmd/edp
 
 FROM alpine:3.23
-RUN apk add --no-cache ca-certificates tzdata && addgroup -g 10001 edp && adduser -D -u 10001 -G edp edp
+RUN apk add --no-cache ca-certificates tzdata fontconfig font-liberation poppler-utils tesseract-ocr tesseract-ocr-data-eng tesseract-ocr-data-tha tesseract-ocr-data-osd && addgroup -g 10001 edp && adduser -D -u 10001 -G edp edp
 COPY --from=build /edp /usr/local/bin/edp
 COPY LICENSE /usr/share/licenses/edp/LICENSE
 COPY third_party /usr/share/licenses/edp
 COPY internal/edp/web/assets/*-OFL.txt /usr/share/licenses/edp/
+COPY internal/edp/web/assets/*.ttf /usr/share/fonts/edp/
+RUN fc-cache -f
 USER 10001:10001
 EXPOSE 8080
 ENTRYPOINT ["edp"]

@@ -16,7 +16,7 @@ window.edpInitEditor = async function(container, signal) {
     const data = await response.json();
     if (signal.aborted || !container.isConnected) return;
     let version = data.current_version;
-    editor = grapesjs.init({container:find('#grapes-editor'),height:'100%',storageManager:false,fromElement:false,plugins:['grapesjs-preset-newsletter'],pluginsOpts:{'grapesjs-preset-newsletter':{useCustomTheme:false}},assetManager:{upload:false},allowScripts:false,canvas:{scripts:[],styles:['/assets/email-fonts.css']}});
+    editor = grapesjs.init({container:find('#grapes-editor'),height:'100%',telemetry:false,cssIcons:'/assets/editor-icons.css',storageManager:false,fromElement:false,plugins:['grapesjs-preset-newsletter'],pluginsOpts:{'grapesjs-preset-newsletter':{useCustomTheme:false}},assetManager:{upload:false},allowScripts:false,canvas:{scripts:[],styles:['/assets/email-fonts.css']}});
     if (data.project&&Object.keys(data.project).length) editor.loadProjectData(data.project);
     else editor.setComponents(data.html);
     status.textContent='Drag blocks into the message. Saved versions remain available to approved campaigns.';

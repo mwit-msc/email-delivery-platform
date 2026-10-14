@@ -83,6 +83,11 @@ func (a *App) render(w http.ResponseWriter, r *http.Request, page string, data m
 		problem(w, 500, "runtime configuration unavailable")
 		return
 	}
+	// Google consent is reached by a CSRF-protected form followed by a redirect.
+	// Permit that single front-channel destination only on pages offering consent.
+	if config.googleEnabled() && (page == "campaign" || page == "campaign-sheet-editor" || page == "google-connections") {
+		w.Header().Set("Content-Security-Policy", strings.Replace(w.Header().Get("Content-Security-Policy"), "form-action 'self'", "form-action 'self' https://accounts.google.com", 1))
+	}
 	data["ProviderName"] = config.ProviderName
 	if data["ProviderName"] == "" {
 		data["ProviderName"] = "Single sign-on"
@@ -197,6 +202,10 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("POST /templates/{id}/data", a.editorData)
 	mux.HandleFunc("GET /campaigns", a.campaigns)
 	mux.HandleFunc("POST /campaigns", a.campaigns)
+	mux.HandleFunc("GET /campaigns/{id}/sheet", a.campaign)
+	mux.HandleFunc("GET /campaigns/{id}/certificate-text/{file}", a.certificateExtractedText)
+	mux.HandleFunc("GET /campaigns/{id}/workspace", a.campaignWorkspace)
+	mux.HandleFunc("POST /campaigns/{id}/workspace", a.campaignWorkspace)
 	mux.HandleFunc("GET /campaigns/{id}/progress", a.campaignProgress)
 	mux.HandleFunc("GET /campaigns/{id}", a.campaign)
 	mux.HandleFunc("POST /campaigns/{id}", a.campaign)
@@ -207,6 +216,10 @@ func (a *App) Handler() http.Handler {
 	mux.HandleFunc("GET /messages/{id}/preview", a.messagePreview)
 	mux.HandleFunc("GET /access", a.access)
 	mux.HandleFunc("POST /access", a.access)
+	mux.HandleFunc("GET /account/connections", a.googleConnections)
+	mux.HandleFunc("POST /account/google/connect", a.googleConnect)
+	mux.HandleFunc("GET /account/google/callback", a.googleCallback)
+	mux.HandleFunc("POST /account/google/disconnect", a.googleDisconnect)
 	mux.HandleFunc("GET /settings", a.settings)
 	mux.HandleFunc("POST /settings", a.settings)
 	mux.HandleFunc("GET /audit", a.auditPage)

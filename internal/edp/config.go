@@ -35,6 +35,9 @@ type Config struct {
 	SMTPTLS               string
 	BounceDomain          string
 	GoogleCredentials     string
+	GoogleClientID        string
+	GoogleClientSecret    string
+	GoogleOAuthDisabled   bool
 	MetricsToken          string
 	ProviderName          string
 	SeedCertificatesFile  string
@@ -77,6 +80,8 @@ func LoadConfig() (Config, error) {
 		SMTPTLS:               env("SMTP_TLS", "starttls"),
 		BounceDomain:          os.Getenv("BOUNCE_DOMAIN"),
 		GoogleCredentials:     os.Getenv("GOOGLE_CREDENTIALS_FILE"),
+		GoogleClientID:        os.Getenv("GOOGLE_OAUTH_CLIENT_ID"),
+		GoogleClientSecret:    os.Getenv("GOOGLE_OAUTH_CLIENT_SECRET"),
 		MetricsToken:          os.Getenv("METRICS_TOKEN"),
 		ProviderName:          env("OIDC_PROVIDER_NAME", "Single sign-on"),
 		SeedCertificatesFile:  os.Getenv("SEED_CERTIFICATES_FILE"),
@@ -168,3 +173,7 @@ func unseal(key []byte, s string) (string, error) {
 const sessionLife = 12 * time.Hour
 
 func (c Config) ssoEnabled() bool { return c.ClientID != "" && !c.OIDCDisabled }
+
+func (c Config) googleEnabled() bool {
+	return c.GoogleClientID != "" && c.GoogleClientSecret != "" && !c.GoogleOAuthDisabled
+}

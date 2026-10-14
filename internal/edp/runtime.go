@@ -36,12 +36,18 @@ type OIDCSettings struct {
 	Scopes          []string `json:"scopes"`
 	GroupsClaim     string   `json:"groups_claim"`
 }
+type GoogleSettings struct {
+	Enabled         bool   `json:"enabled"`
+	ClientID        string `json:"client_id"`
+	ClientSecretEnc string `json:"client_secret_enc"`
+}
 type RuntimeSettings struct {
-	SMTP      *SMTPSettings `json:"smtp,omitempty"`
-	Secondary *SMTPSettings `json:"secondary,omitempty"`
-	PMG       *PMGSettings  `json:"pmg,omitempty"`
-	OIDC      *OIDCSettings `json:"oidc,omitempty"`
-	PublicURL string        `json:"public_url,omitempty"`
+	Google    *GoogleSettings `json:"google,omitempty"`
+	SMTP      *SMTPSettings   `json:"smtp,omitempty"`
+	Secondary *SMTPSettings   `json:"secondary,omitempty"`
+	PMG       *PMGSettings    `json:"pmg,omitempty"`
+	OIDC      *OIDCSettings   `json:"oidc,omitempty"`
+	PublicURL string          `json:"public_url,omitempty"`
 }
 
 func (a *App) runtimeConfig(ctx context.Context) (Config, error) {
@@ -108,6 +114,15 @@ func readRuntimeConfig(ctx context.Context, q rowQuerier, base Config) (Config, 
 			return c, e
 		}
 	}
+	if s.Google != nil {
+		c.GoogleClientID = s.Google.ClientID
+		c.GoogleOAuthDisabled = !s.Google.Enabled
+		var e error
+		c.GoogleClientSecret, e = decrypt(s.Google.ClientSecretEnc)
+		if e != nil {
+			return c, e
+		}
+	}
 	if c.ProviderName == "" {
 		c.ProviderName = "Single sign-on"
 	}
@@ -140,6 +155,8 @@ func (a *App) saveRuntime(ctx context.Context, group string, c Config) error {
 		s.Secondary = &SMTPSettings{Address: c.SecondarySMTPAddress, TLS: c.SecondarySMTPTLS, Username: c.SecondarySMTPUser, PasswordEnc: seal(a.C.Secret, c.SecondarySMTPPassword)}
 	case "pmg":
 		s.PMG = &PMGSettings{c.PMGURL, c.PMGUser, seal(a.C.Secret, c.PMGPassword), c.PMGNodes, c.PMGCAPEM}
+	case "google":
+		s.Google = &GoogleSettings{c.googleEnabled(), c.GoogleClientID, seal(a.C.Secret, c.GoogleClientSecret)}
 	case "oidc":
 		s.OIDC = &OIDCSettings{c.ssoEnabled(), c.Issuer, c.ProviderName, c.ClientID, seal(a.C.Secret, c.ClientSecret), c.OIDCScopes, c.GroupsClaim}
 		s.PublicURL = c.PublicURL
@@ -158,6 +175,11 @@ func (a *App) saveRuntime(ctx context.Context, group string, c Config) error {
 			return e
 		}
 		if _, e = tx.Exec(ctx, "DELETE FROM oauth_states"); e != nil {
+			return e
+		}
+	}
+	if group == "google" || group == "oidc" {
+		if _, e = tx.Exec(ctx, "DELETE FROM google_oauth_states"); e != nil {
 			return e
 		}
 	}

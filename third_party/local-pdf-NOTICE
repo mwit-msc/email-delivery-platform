@@ -1,0 +1,6 @@
+Local PDF extraction uses Poppler command-line utilities (GPL-2.0-or-later), installed through the Alpine package repository.
+Upstream: https://poppler.freedesktop.org/
+Local OCR uses Tesseract and English, Thai and orientation language data (Apache-2.0), installed through the Alpine package repository.
+Upstream: https://github.com/tesseract-ocr/tesseract
+Language models: https://github.com/tesseract-ocr/tessdata_fast
+These are separate local executables; EDP does not send document content to an external OCR service.

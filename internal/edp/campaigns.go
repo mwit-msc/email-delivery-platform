@@ -6,12 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/jackc/pgx/v5"
-	"golang.org/x/oauth2/google"
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -26,6 +25,29 @@ func parseCSV(reader io.Reader) ([][]string, error) {
 		return nil, fmt.Errorf("CSV exceeds the 8 MiB import limit")
 	}
 	r := csv.NewReader(strings.NewReader(string(data)))
+	// Prefer a consistent record width, so punctuation inside a data cell
+	// cannot outweigh the delimiter used by the header and surrounding rows.
+	best := 0
+	for _, delimiter := range []rune{',', '\t', ';'} {
+		probe := csv.NewReader(strings.NewReader(string(data)))
+		probe.Comma, probe.FieldsPerRecord = delimiter, -1
+		probe.TrimLeadingSpace = true
+		widths := map[int]int{}
+		for record := 0; record < 10; record++ {
+			fields, err := probe.Read()
+			if err != nil {
+				break
+			}
+			if len(fields) > 1 {
+				widths[len(fields)]++
+			}
+		}
+		for width, count := range widths {
+			if score := count*100 + min(width, 52); score > best {
+				best, r.Comma = score, delimiter
+			}
+		}
+	}
 	r.FieldsPerRecord = -1
 	r.TrimLeadingSpace = true
 	rows, e := r.ReadAll()
@@ -44,9 +66,9 @@ func parseCSV(reader io.Reader) ([][]string, error) {
 	return rows, nil
 }
 func (a *App) sheetRows(ctx context.Context, link string) ([][]string, error) {
-	if a.C.GoogleCredentials == "" {
-		return nil, fmt.Errorf("Google Sheets import requires GOOGLE_CREDENTIALS_FILE and read access to the sheet")
-	}
+	return a.sheetRowsForUser(ctx, link, "")
+}
+func (a *App) sheetRowsForUser(ctx context.Context, link, user string) ([][]string, error) {
 	u, e := url.Parse(link)
 	if e != nil || u.Scheme != "https" || u.Host != "docs.google.com" {
 		return nil, fmt.Errorf("use a Google Sheets HTTPS URL")
@@ -59,16 +81,15 @@ func (a *App) sheetRows(ctx context.Context, link string) ([][]string, error) {
 	if len(id) > 150 || strings.ContainsAny(id, "?&#") {
 		return nil, fmt.Errorf("invalid spreadsheet ID")
 	}
-	data, e := os.ReadFile(a.C.GoogleCredentials)
+	owner, connection, e := a.googleReadIdentity(ctx, user)
 	if e != nil {
-		return nil, fmt.Errorf("cannot read Google credentials")
+		return nil, e
 	}
-	conf, e := google.JWTConfigFromJSON(data, "https://www.googleapis.com/auth/spreadsheets.readonly")
+	client, e := a.googleReadClientScope(ctx, owner, connection, "https://www.googleapis.com/auth/spreadsheets.readonly")
 	if e != nil {
-		return nil, fmt.Errorf("expected Google service-account credentials")
+		return nil, e
 	}
-	client := conf.Client(ctx)
-	client.Timeout = 15 * time.Second
+
 	get := func(path string, target any) error {
 		req, e := http.NewRequestWithContext(ctx, "GET", "https://sheets.googleapis.com/v4/spreadsheets/"+url.PathEscape(id)+path, nil)
 		if e != nil {
@@ -80,7 +101,7 @@ func (a *App) sheetRows(ctx context.Context, link string) ([][]string, error) {
 		}
 		defer res.Body.Close()
 		if res.StatusCode != 200 {
-			return fmt.Errorf("Google Sheets returned %d; share this sheet with the configured service account", res.StatusCode)
+			return fmt.Errorf("Google Sheets returned %d; check read access for the connected Google account", res.StatusCode)
 		}
 		return json.NewDecoder(io.LimitReader(res.Body, 8<<20)).Decode(target)
 	}
@@ -261,6 +282,31 @@ func (a *App) mapCampaignWith(ctx context.Context, tx pgx.Tx, id string, m Mappi
 	if len(rows) < 2 {
 		return fmt.Errorf("import data first")
 	}
+	var linkRaw []byte
+	if e = tx.QueryRow(ctx, "SELECT certificate_links FROM campaigns WHERE id=$1", id).Scan(&linkRaw); e != nil {
+		return e
+	}
+	links, e := decodeLinks(linkRaw)
+	if e != nil {
+		return e
+	}
+	if len(links.Matches) > 0 && (m.URL != links.URLColumn || m.Constants["certificate_url"] != "") {
+		return fmt.Errorf("map certificate links to the reviewed link column; use the sheet to change links")
+	}
+	if len(links.Matches) > 0 {
+		if _, ok := m.Columns["certificate_url"]; ok {
+			return fmt.Errorf("certificate_url uses the reviewed link column")
+		}
+		for _, rule := range m.Rules {
+			if _, ok := rule.Variables["certificate_url"]; ok {
+				return fmt.Errorf("award rules cannot override reviewed certificate links")
+			}
+		}
+	}
+	linkErrors, e := campaignLinkErrors(ctx, tx, id, rows)
+	if e != nil {
+		return e
+	}
 	// A mapping change must not silently include previously excluded certificates.
 	excluded := map[int]bool{}
 	prior, e := tx.Query(ctx, "SELECT ordinal,source_ordinals FROM campaign_rows WHERE campaign_id=$1 AND excluded", id)
@@ -320,6 +366,9 @@ func (a *App) mapCampaignWith(ctx context.Context, tx pgx.Tx, id string, m Mappi
 			award = m.DefaultAward
 		}
 		var errs []string
+		if message := linkErrors[i+2]; message != "" {
+			errs = append(errs, message)
+		}
 		if !validAddress(email) {
 			errs = append(errs, "Invalid recipient email")
 		}
@@ -431,6 +480,9 @@ func (a *App) approveCampaign(ctx context.Context, id, actor string) error {
 	}
 	if state != "draft" {
 		return fmt.Errorf("campaign must be a draft")
+	}
+	if e = requireReviewedLinks(ctx, tx, id); e != nil {
+		return e
 	}
 	var n, invalid int
 	e = tx.QueryRow(ctx, "SELECT count(*) FILTER(WHERE NOT excluded),count(*) FILTER(WHERE NOT excluded AND cardinality(errors)>0) FROM campaign_rows WHERE campaign_id=$1", id).Scan(&n, &invalid)
@@ -640,7 +692,9 @@ func (a *App) campaign(w http.ResponseWriter, r *http.Request) {
 			}
 			var rows [][]string
 			if r.FormValue("sheet_url") != "" {
-				rows, e = a.sheetRows(r.Context(), r.FormValue("sheet_url"))
+				rows, e = a.sheetRowsForUser(r.Context(), r.FormValue("sheet_url"), person(r).ID)
+			} else if text := r.FormValue("paste"); strings.TrimSpace(text) != "" {
+				rows, e = parseCSV(strings.NewReader(text))
 			} else {
 				file, header, err := r.FormFile("csv")
 				if err != nil {
@@ -649,6 +703,9 @@ func (a *App) campaign(w http.ResponseWriter, r *http.Request) {
 				}
 				defer file.Close()
 				rows, e = parseImport(file, header.Filename, r.FormValue("sheet"))
+			}
+			if e == nil {
+				rows, e = importHeader(rows, r.FormValue("header_row"))
 			}
 			if e == nil {
 				e = a.replaceCampaignSource(r.Context(), id, rows)
@@ -691,7 +748,19 @@ func (a *App) campaign(w http.ResponseWriter, r *http.Request) {
 				if json.Unmarshal(stored, &previous) == nil {
 					m.Columns, m.Constants = previous.Columns, previous.Constants
 				}
+				if m.Columns == nil {
+					m.Columns = map[string]int{}
+				}
+				if m.Constants == nil {
+					m.Constants = map[string]string{}
+				}
 				for key := range r.Form {
+					if strings.HasPrefix(key, "var.") {
+						m.Columns[strings.TrimPrefix(key, "var.")] = parse(key)
+					}
+					if strings.HasPrefix(key, "const.") {
+						m.Constants[strings.TrimPrefix(key, "const.")] = r.FormValue(key)
+					}
 					if strings.HasPrefix(key, "rule.") && (r.FormValue(key) != "" || m.CombineRecipients) {
 						award := strings.TrimPrefix(key, "rule.")
 						rule := AwardRule{Award: award, Template: r.FormValue(key)}
@@ -730,7 +799,11 @@ func (a *App) campaign(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.audit(r.Context(), person(r).ID, "campaign."+action, scope, id)
-		http.Redirect(w, r, "/campaigns/"+id, 303)
+		target := "/campaigns/" + id
+		if r.FormValue("return_to") == "sheet" {
+			target += "/sheet?tab=mapping"
+		}
+		http.Redirect(w, r, target, 303)
 		return
 	}
 	rows, e := a.query(r.Context(), "SELECT r.*,t.name AS template_name FROM campaign_rows r LEFT JOIN templates t ON t.id=r.template_id WHERE campaign_id=$1 ORDER BY ordinal LIMIT 5000", id)
@@ -747,6 +820,12 @@ func (a *App) campaign(w http.ResponseWriter, r *http.Request) {
 	}
 	templates, _ := a.query(r.Context(), "SELECT t.id,t.slug,t.name,v.variables FROM templates t JOIN template_versions v ON v.template_id=t.id AND v.version=t.current_version WHERE application_id=$1 AND NOT t.archived ORDER BY name", scope)
 	selected := r.URL.Query().Get("template")
+	if selected == "" && data["kind"] == "bulk" {
+		var saved BulkMapping
+		raw, _ := json.Marshal(data["mapping"])
+		json.Unmarshal(raw, &saved)
+		selected = saved.Template
+	}
 	if selected == "" && len(templates) > 0 {
 		selected = templates[0]["id"].(string)
 	}
@@ -810,8 +889,31 @@ func (a *App) campaign(w http.ResponseWriter, r *http.Request) {
 			ruleVariables[rule.Award] = string(raw)
 		}
 	}
+	certificateVariables := []string{}
+	seenVariables := map[string]bool{"school_name": true, "certificate_url": true, "certificate_items": true, "certificate_count": true, "certificate_list": true}
+	for _, t := range templates {
+		raw, _ := json.Marshal(t["variables"])
+		var names []string
+		json.Unmarshal(raw, &names)
+		for _, name := range names {
+			if !seenVariables[name] {
+				seenVariables[name] = true
+				certificateVariables = append(certificateVariables, name)
+			}
+		}
+	}
+	sort.Strings(certificateVariables)
 	fields, mappingJSON := campaignMappingReview(data["kind"].(string), data["mapping"], headers)
-	a.render(w, r, "campaign", map[string]any{"MappingFields": fields, "MappingJSON": mappingJSON, "Campaign": data, "Rows": rows, "Headers": headers, "Awards": sourceAwards(source), "Mapping": mapping, "NameColumns": nameColumns, "CertificateCount": certificates, "RuleSelections": ruleSelections, "RuleVariables": ruleVariables, "Scope": scope, "SheetConfigured": a.C.GoogleCredentials != "", "Templates": templates, "SelectedTemplate": selected, "TemplateVariables": variables})
+	page := "campaign"
+	if strings.HasSuffix(r.URL.Path, "/sheet") {
+		page = "campaign-sheet-editor"
+	}
+	googleView := a.googleConnectionView(r.Context(), person(r).ID)
+	googleReturn := r.URL.RequestURI()
+	if page == "campaign-sheet-editor" {
+		googleReturn = "/campaigns/" + id + "/sheet?tab=review"
+	}
+	a.render(w, r, page, map[string]any{"CertificateVariables": certificateVariables, "MappingFields": fields, "MappingJSON": mappingJSON, "Campaign": data, "Rows": rows, "Headers": headers, "Awards": sourceAwards(source), "Mapping": mapping, "NameColumns": nameColumns, "CertificateCount": certificates, "RuleSelections": ruleSelections, "RuleVariables": ruleVariables, "Scope": scope, "SheetConfigured": googleView["CanRead"], "Google": googleView, "GoogleReturnTo": googleReturn, "GoogleResult": r.URL.Query().Get("google"), "Templates": templates, "SelectedTemplate": selected, "TemplateVariables": variables})
 }
 func (a *App) campaignPreview(w http.ResponseWriter, r *http.Request) {
 	var scope, tid string
@@ -884,7 +986,10 @@ func (a *App) replaceCampaignSource(ctx context.Context, id string, rows [][]str
 		return fmt.Errorf("only draft campaigns may be imported")
 	}
 	raw, _ := json.Marshal(rows)
-	if _, e = tx.Exec(ctx, "UPDATE campaigns SET source_rows=$2,mapping='{}' WHERE id=$1", id, raw); e != nil {
+	if _, e = tx.Exec(ctx, "DELETE FROM certificate_scan_files WHERE campaign_id=$1", id); e != nil {
+		return e
+	}
+	if _, e = tx.Exec(ctx, "UPDATE campaigns SET source_rows=$2,mapping='{}',certificate_links='{}' WHERE id=$1", id, raw); e != nil {
 		return e
 	}
 	if _, e = tx.Exec(ctx, "DELETE FROM campaign_rows WHERE campaign_id=$1", id); e != nil {
@@ -936,6 +1041,13 @@ func (a *App) mapBulkCampaign(ctx context.Context, id, templateID string, emailC
 		return e
 	}
 	defer tx.Rollback(ctx)
+	if e = a.mapBulkCampaignWith(ctx, tx, id, templateID, emailColumn, columns, constants); e != nil {
+		return e
+	}
+	return tx.Commit(ctx)
+}
+func (a *App) mapBulkCampaignWith(ctx context.Context, tx pgx.Tx, id, templateID string, emailColumn int, columns map[string]int, constants map[string]string) error {
+	var e error
 	var scope, state string
 	var data []byte
 	if e = tx.QueryRow(ctx, "SELECT application_id,state,source_rows FROM campaigns WHERE id=$1 FOR UPDATE", id).Scan(&scope, &state, &data); e != nil {
@@ -956,6 +1068,24 @@ func (a *App) mapBulkCampaign(ctx context.Context, id, templateID string, emailC
 	}
 	if len(rows) < 2 {
 		return fmt.Errorf("import recipients first")
+	}
+	excluded := map[int]bool{}
+	prior, e := tx.Query(ctx, "SELECT ordinal FROM campaign_rows WHERE campaign_id=$1 AND excluded", id)
+	if e != nil {
+		return e
+	}
+	for prior.Next() {
+		var ordinal int
+		if e = prior.Scan(&ordinal); e != nil {
+			prior.Close()
+			return e
+		}
+		excluded[ordinal] = true
+	}
+	e = prior.Err()
+	prior.Close()
+	if e != nil {
+		return e
 	}
 	if _, e = tx.Exec(ctx, "DELETE FROM campaign_rows WHERE campaign_id=$1", id); e != nil {
 		return e
@@ -983,7 +1113,7 @@ func (a *App) mapBulkCampaign(ctx context.Context, id, templateID string, emailC
 			errs = append(errs, "Duplicate recipient message")
 		}
 		seen[dispatch] = true
-		_, e = tx.Exec(ctx, "INSERT INTO campaign_rows(id,campaign_id,ordinal,recipient,template_id,template_version,variables,errors,dispatch_key) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)", newID("row_"), id, n+2, recipient, templateID, version, encoded, errs, dispatch)
+		_, e = tx.Exec(ctx, "INSERT INTO campaign_rows(id,campaign_id,ordinal,recipient,template_id,template_version,variables,errors,dispatch_key,excluded) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)", newID("row_"), id, n+2, recipient, templateID, version, encoded, errs, dispatch, excluded[n+2])
 		if e != nil {
 			return e
 		}
@@ -995,7 +1125,7 @@ func (a *App) mapBulkCampaign(ctx context.Context, id, templateID string, emailC
 	if _, e = tx.Exec(ctx, "UPDATE campaigns SET mapping=$2 WHERE id=$1", id, mapping); e != nil {
 		return e
 	}
-	return tx.Commit(ctx)
+	return nil
 }
 
 func sourceAwards(rows [][]string) []string {

@@ -84,6 +84,7 @@ func (a *App) Work(ctx context.Context) error {
 	}
 	go a.pmgLoop(ctx)
 	go a.webhookLoop(ctx)
+	go a.certificateScanLoop(ctx)
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	maintenance := time.NewTicker(30 * time.Second)
@@ -176,6 +177,7 @@ func (a *App) maintenance(ctx context.Context) {
 	}
 	tx.Exec(ctx, "DELETE FROM sessions WHERE expires_at<now()")
 	tx.Exec(ctx, "DELETE FROM oauth_states WHERE expires_at<now()")
+	tx.Exec(ctx, "DELETE FROM google_oauth_states WHERE expires_at<now()")
 	tx.Exec(ctx, "DELETE FROM login_attempts WHERE expires_at<now()")
 	tx.Exec(ctx, "UPDATE messages SET html='',plain='' WHERE created_at<now()-$1::interval AND status NOT IN('queued','retry_wait','sending')", fmt.Sprintf("%d days", a.C.RetentionDays))
 	tx.Exec(ctx, "DELETE FROM webhook_jobs WHERE status NOT IN('queued','sending') AND created_at<now()-$1::interval", fmt.Sprintf("%d days", a.C.RetentionDays))
@@ -183,6 +185,7 @@ func (a *App) maintenance(ctx context.Context) {
 		return
 	}
 	// Single statements keep cleanup from reversing admission/worker lock order.
+	a.DB.Exec(ctx, "DELETE FROM certificate_scan_files f WHERE state IN('done','error') AND finished_at<now()-$1::interval AND NOT EXISTS(SELECT 1 FROM campaigns c WHERE c.id=f.campaign_id AND c.certificate_links->>'scan_state'='reading')", fmt.Sprintf("%d days", a.C.RetentionDays))
 	a.DB.Exec(ctx, "UPDATE otp_challenges SET code_hash=''::bytea WHERE expires_at<=clock_timestamp() AND octet_length(code_hash)>0")
 	a.DB.Exec(ctx, "UPDATE messages m SET html='',plain='' WHERE m.otp_encrypted AND (m.html<>'' OR m.plain<>'') AND EXISTS(SELECT 1 FROM otp_challenges o WHERE o.message_id=m.id AND (o.expires_at<=clock_timestamp() OR o.consumed_at IS NOT NULL OR o.revoked_at IS NOT NULL OR o.attempts>=5))")
 }

@@ -1229,7 +1229,7 @@ paths:
                 file:
                   type: string
                   format: binary
-                  description: CSV or XLSX up to 8 MiB.
+                  description: CSV, TSV or XLSX up to 8 MiB. CSV delimiters are detected (comma, semicolon or tab).
                 sheet:
                   type: string
                   description: Exact XLSX tab name; defaults to first tab when omitted.

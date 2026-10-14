@@ -92,6 +92,11 @@ async function activatePage() {
   try {
     const statistics = page.querySelector('#stats-panel');
     const editor = page.querySelector('#template-editor');
+    const sheet = page.querySelector('#campaign-sheet');
+    if (sheet) {
+      await pageScript('/assets/campaign-sheet.js');
+      if (!lifetime.signal.aborted) window.edpInitSheet(sheet, lifetime.signal);
+    }
     if (statistics) {
       await pageScript('/assets/chart.umd.js');
       await pageScript('/assets/charts.js');
@@ -112,7 +117,7 @@ async function activatePage() {
 }
 document.addEventListener('htmx:beforeRequest', event => {
   if (!event.detail.boosted) return;
-  if (window.edpPageDirty?.() && !confirm('Discard unsaved email changes?')) { event.preventDefault(); return; }
+  if (window.edpPageDirty?.() && !confirm('Discard unsaved changes?')) { event.preventDefault(); return; }
   document.querySelector('.edp-main')?.classList.add('navigation-loading');
 });
 document.addEventListener('htmx:afterRequest', event => {

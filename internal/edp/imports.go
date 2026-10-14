@@ -37,14 +37,14 @@ func parseImport(r io.Reader, filename, sheet string) ([][]string, error) {
 	switch strings.ToLower(path.Ext(filename)) {
 	case ".xlsx":
 		return parseXLSX(r, sheet)
-	case ".csv":
+	case ".csv", ".tsv":
 		rows, err := parseCSV(r)
 		if err != nil {
 			return nil, err
 		}
 		return normalizeImportRows(rows)
 	default:
-		return nil, fmt.Errorf("upload a CSV or XLSX file")
+		return nil, fmt.Errorf("upload a CSV, TSV or XLSX file")
 	}
 }
 
@@ -492,4 +492,16 @@ func parseXLSX(r io.Reader, sheet string) ([][]string, error) {
 		}
 	}
 	return normalizeImportRows(rows)
+}
+
+// importHeader allows title and instruction rows above the chosen header.
+func importHeader(rows [][]string, value string) ([][]string, error) {
+	if value == "" {
+		value = "1"
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil || n < 1 || n >= len(rows) {
+		return nil, fmt.Errorf("choose a header row before the last data row")
+	}
+	return normalizeImportRows(rows[n-1:])
 }

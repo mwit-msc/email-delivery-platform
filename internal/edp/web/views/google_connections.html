@@ -1,0 +1,16 @@
+{{define "google-status"}}
+{{if eq .GoogleResult "connected"}}<div class="alert alert-success" role="status">Your Google account is connected.</div>{{else if eq .GoogleResult "disconnected"}}<div class="alert alert-success" role="status">Your Google account was disconnected from EDP.</div>{{else if eq .GoogleResult "cancelled"}}<div class="alert alert-info" role="status">Google connection cancelled. You can try again whenever you’re ready.</div>{{end}}
+{{end}}
+{{define "google-connection"}}
+<div class="google-connection d-flex flex-wrap align-items-center gap-3 mb-4">
+<div class="flex-grow-1">{{if .Google.Connected}}<strong>Your Google Drive</strong><span class="d-block small text-secondary">{{.Google.Email}} · Read-only access</span>{{else if .Google.Stale}}<strong>Reconnect your Google account</strong><span class="d-block small text-secondary">Application settings changed. Connect again to continue importing or scanning.</span>{{else}}<strong>Your Google Drive</strong><span class="d-block small text-secondary">{{if .Google.Configured}}Connect your own account for folder scans and Google Sheets imports.{{else}}Ask an administrator to enable Google account connections.{{end}}</span>{{end}}{{if and .Google.ServiceAccount (not .Google.HasConnection)}}<small class="d-block text-secondary">A service account is available for files shared with it.</small>{{end}}{{if .Google.Unavailable}}<small class="d-block text-danger">Google connection status is temporarily unavailable.</small>{{end}}</div>
+{{if .Google.Configured}}<form hx-boost="false" method="post" action="/account/google/connect"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="return_to" value="{{.GoogleReturnTo}}"><button class="btn btn-outline-primary">{{if .Google.Connected}}Change account{{else if .Google.Stale}}Reconnect Google Drive{{else}}Connect Google Drive{{end}}</button></form>{{end}}
+{{if .Google.HasConnection}}<form hx-boost="false" method="post" action="/account/google/disconnect"><input type="hidden" name="csrf" value="{{.CSRF}}"><input type="hidden" name="return_to" value="{{.GoogleReturnTo}}"><button class="btn btn-outline-secondary">Disconnect</button></form>{{end}}
+{{if and .Platform (not .Google.Configured)}}<a href="/settings?tab=google" class="btn btn-outline-secondary">Configure Google application</a>{{end}}
+</div>
+{{end}}
+{{define "google-connections"}}
+<div class="page-heading"><div><h1>My connections</h1><p>Connect services to your personal EDP account.</p></div></div>
+{{template "google-status" .}}
+<section class="panel"><h2 class="mb-4">Google Drive</h2>{{template "google-connection" .}}<p class="text-secondary mb-0">EDP reads files you choose for imports and certificate scans. Spreadsheet edits stay in your campaign’s snapshot. Background scans use the account that started them; disconnecting stops future access through this connection. You can also remove EDP’s permission in your Google account.</p></section>
+{{end}}

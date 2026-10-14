@@ -11,7 +11,7 @@ import (
 )
 
 func runtimeView(c Config) map[string]any {
-	return map[string]any{"SMTPAddress": c.SMTPAddress, "SMTPTLS": c.SMTPTLS, "SMTPUser": c.SMTPUser, "SMTPSecretSet": c.SMTPPassword != "", "BounceDomain": c.BounceDomain, "SecondaryAddress": c.SecondarySMTPAddress, "SecondaryTLS": c.SecondarySMTPTLS, "SecondaryUser": c.SecondarySMTPUser, "SecondarySecretSet": c.SecondarySMTPPassword != "", "PMGURL": c.PMGURL, "PMGUser": c.PMGUser, "PMGSecretSet": c.PMGPassword != "", "PMGNodes": strings.Join(c.PMGNodes, ", "), "PMGCAPEM": c.PMGCAPEM, "Issuer": c.Issuer, "ProviderName": c.ProviderName, "ClientID": c.ClientID, "OIDCSecretSet": c.ClientSecret != "", "OIDCEnabled": c.ssoEnabled(), "Scopes": strings.Join(c.OIDCScopes, " "), "GroupsClaim": c.GroupsClaim, "PublicURL": c.PublicURL}
+	return map[string]any{"SMTPAddress": c.SMTPAddress, "SMTPTLS": c.SMTPTLS, "SMTPUser": c.SMTPUser, "SMTPSecretSet": c.SMTPPassword != "", "BounceDomain": c.BounceDomain, "SecondaryAddress": c.SecondarySMTPAddress, "SecondaryTLS": c.SecondarySMTPTLS, "SecondaryUser": c.SecondarySMTPUser, "SecondarySecretSet": c.SecondarySMTPPassword != "", "PMGURL": c.PMGURL, "PMGUser": c.PMGUser, "PMGSecretSet": c.PMGPassword != "", "PMGNodes": strings.Join(c.PMGNodes, ", "), "PMGCAPEM": c.PMGCAPEM, "Issuer": c.Issuer, "ProviderName": c.ProviderName, "ClientID": c.ClientID, "OIDCSecretSet": c.ClientSecret != "", "OIDCEnabled": c.ssoEnabled(), "Scopes": strings.Join(c.OIDCScopes, " "), "GroupsClaim": c.GroupsClaim, "PublicURL": c.PublicURL, "GoogleClientID": c.GoogleClientID, "GoogleSecretSet": c.GoogleClientSecret != "", "GoogleEnabled": c.googleEnabled()}
 }
 func keepSecret(r *http.Request, name, old string) string {
 	if r.FormValue(name+"_clear") == "on" {
@@ -70,6 +70,16 @@ func (a *App) connectionCandidate(r *http.Request, group string, c Config) (Conf
 		if e := validateCAPEM(c.PMGCAPEM); e != nil {
 			return c, e
 		}
+	case "google":
+		c.GoogleClientID = strings.TrimSpace(r.FormValue("client_id"))
+		c.GoogleClientSecret = keepSecret(r, "client_secret", c.GoogleClientSecret)
+		c.GoogleOAuthDisabled = r.FormValue("enabled") != "on"
+		if !c.GoogleOAuthDisabled && (c.GoogleClientID == "" || c.GoogleClientSecret == "") {
+			return c, fmt.Errorf("Google client ID and secret are required")
+		}
+		if e := validateIssuer(c.PublicURL, c.Dev); e != nil {
+			return c, e
+		}
 	case "oidc":
 		c.Issuer = strings.TrimSuffix(strings.TrimRight(strings.TrimSpace(r.FormValue("issuer")), "/"), "/.well-known/openid-configuration")
 		c.ProviderName = strings.TrimSpace(r.FormValue("provider_name"))
@@ -119,7 +129,7 @@ func (a *App) settings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	tab := r.URL.Query().Get("tab")
-	if !contains([]string{"limits", "smtp", "pmg", "oidc", "account"}, tab) {
+	if !contains([]string{"limits", "smtp", "pmg", "oidc", "google", "account"}, tab) {
 		tab = "limits"
 	}
 	if r.Method == "POST" {
